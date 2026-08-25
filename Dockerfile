@@ -4,4 +4,4 @@ RUN apt-get update && apt-get install -y ffmpeg gcc libpq-dev && rm -rf /var/lib
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-CMD ["uvicorn", "ai_caller.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+CMD ["sh", "-c", "uvicorn ai_caller.main:app --host 0.0.0.0 --port ${PORT:-10000} --workers 2"]
