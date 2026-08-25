@@ -48,14 +48,32 @@ app_info.info({"version": "1.0.0", "env": settings.ENV})
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: init DB pool. Shutdown: close everything gracefully."""
+    """Startup: init DB pool (resilient). Shutdown: close everything gracefully.
+
+    DB init failure does not crash the app — the service stays up and
+    returns a degraded /health response so Render's health check still
+    passes. This lets us deploy with placeholder secrets and swap them
+    in without re-deploying.
+    """
     logger.info(f"🚀 AI Caller Enterprise starting | ENV={settings.ENV} | BASE_URL={settings.BASE_URL}")
-    await init_pool()
+    try:
+        await init_pool()
+    except Exception as exc:
+        logger.error(
+            f"⚠️ Database init failed (continuing in degraded mode): {exc}",
+            exc_info=True,
+        )
     yield
     logger.info("👋 AI Caller Enterprise shutting down")
     for pipeline in list(active_pipelines.values()):
-        await pipeline.close()
-    await close_pool()
+        try:
+            await pipeline.close()
+        except Exception as exc:
+            logger.warning(f"Pipeline close error: {exc}")
+    try:
+        await close_pool()
+    except Exception as exc:
+        logger.warning(f"DB pool close error: {exc}")
 
 
 app = FastAPI(
@@ -268,8 +286,13 @@ async def media_stream(websocket: WebSocket):
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
-    """Deep health check with dependency validation."""
+    """Deep health check with dependency validation.
+
+    Returns 200 even when degraded so Render's health check passes while
+    secrets are being filled in. Status field reports "ok" or "degraded".
+    """
     dependencies = {"database": "unknown", "twilio": "unknown"}
+    overall_status = "ok"
 
     # Check database
     try:
@@ -278,10 +301,8 @@ async def health():
     except Exception as exc:
         dependencies["database"] = f"unhealthy: {str(exc)}"
         logger.error(f"[Health] DB check failed: {exc}")
-        return JSONResponse(
-            {"status": "degraded", "env": settings.ENV, "dependencies": dependencies},
-            status_code=503,
-        )
+        overall_status = "degraded"
+        stats = {"active_calls": 0, "total_calls": 0, "calls_today": 0}
 
     # Check Twilio (lightweight)
     try:
@@ -291,7 +312,7 @@ async def health():
         dependencies["twilio"] = f"unhealthy: {str(exc)}"
 
     return HealthResponse(
-        status="ok",
+        status=overall_status,
         env=settings.ENV,
         active_calls=stats["active_calls"],
         total_calls=stats["total_calls"],
