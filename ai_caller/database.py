@@ -62,18 +62,20 @@ CREATE INDEX IF NOT EXISTS idx_metrics_call ON call_metrics(call_sid);
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 async def init_pool():
-    """Initialize database connection pool with retry logic."""
+    """Initialize database connection pool with retry logic.
+
+    SSL is handled via the URL's ?sslmode=require param. We do NOT pass
+    a separate ssl= kwarg because that conflicts with channel_binding
+    when both are set.
+    """
     global _pool
     settings = get_settings()
-
-    ssl_mode = "require" if "neon.tech" in settings.DATABASE_URL else None
 
     _pool = await asyncpg.create_pool(
         settings.DATABASE_URL,
         min_size=settings.DATABASE_POOL_MIN,
         max_size=settings.DATABASE_POOL_MAX,
         command_timeout=settings.REQUEST_TIMEOUT,
-        ssl=ssl_mode,
     )
 
     async with _pool.acquire() as conn:
