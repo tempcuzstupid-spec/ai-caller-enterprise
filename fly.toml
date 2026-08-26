@@ -41,11 +41,11 @@ primary_region = "iad"
   [[services.http_checks]]
     interval = "10s"
     timeout = "5s"
-    grace_period = "30s"
+    grace_period = "60s"
     method = "get"
     path = "/health"
 
 [[vm]]
   cpu_kind = "shared"
-  cpus = 1
-  memory_mb = 1024
+  cpus = 2
+  memory_mb = 2048
