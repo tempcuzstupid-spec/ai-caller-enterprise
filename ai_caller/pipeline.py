@@ -86,18 +86,28 @@ class CallPipeline:
         calls_active.labels(direction=call_state.direction).inc()
 
     def _setup_system_prompt(self):
-        """Configure AI persona based on call purpose."""
+        """Configure AI persona based on call purpose.
+
+        Openers are deliberately designed to NOT trigger spam filters or
+        sound like a robocaller. Sound like a real person calling for
+        a legitimate reason; let the recipient opt out easily.
+        """
         purpose = self.call_state.purpose
         context = self.call_state.context
 
         personas = {
             "sales_demo": (
-                f"You are a friendly sales rep. {context} "
-                "Ask discovery questions, handle objections calmly, "
-                "and push for a meeting booking. Be persistent but polite."
+                f"You are a knowledgeable product specialist calling about a product line. "
+                f"{context} "
+                "Open by briefly introducing yourself and the reason for the call, then "
+                "ask a discovery question. Sound like a person, not a script. "
+                "If the recipient is busy, uninterested, or asks to be removed, "
+                "respect that immediately and offer to follow up another way. "
+                "Never use high-pressure sales tactics, never claim urgency that does not exist, "
+                "and never refuse to identify who you are or who you represent."
             ),
             "support": (
-                "You are a technical support agent. Empathize with the user, "
+                "You are a technical support specialist. Empathize with the user, "
                 "ask clarifying questions, and attempt to resolve before transferring."
             ),
             "reminder": (
@@ -126,7 +136,18 @@ class CallPipeline:
         if self.call_state.purpose == "reminder":
             greeting = f"Hi, this is a reminder call. {self.call_state.context}"
         elif self.call_state.purpose == "sales_demo":
-            greeting = "Hey! I wanted to reach out about a special offer. Do you have a quick minute?"
+            # Sound like a real person, not a robocaller. Identify who we are,
+            # give them an easy out, and ask a low-pressure question.
+            caller_name = getattr(self.call_state, "caller_name", None) or "an AI assistant"
+            company = getattr(self.call_state, "company", None) or "our team"
+            greeting = (
+                f"Hi, this is {caller_name} calling on behalf of {company}. "
+                f"I wanted to introduce a product line that might be relevant to you. "
+                f"If now is not a good time, I completely understand — would you like me to "
+                f"follow up another way, or is now actually okay?"
+            )
+        elif self.call_state.purpose == "personal_assistant":
+            greeting = "Hi, this is a personal assistant calling on behalf of a client. How can I help you?"
 
         self.messages.append({"role": "assistant", "content": greeting})
         await self._speak(greeting)
