@@ -1,7 +1,7 @@
 """Enterprise security layer.
 
 Features:
-  - Twilio webhook signature validation
+  - Twilio webhook signature validation (via official twilio SDK)
   - API key authentication for admin endpoints
   - Rate limiting
   - PII redaction in logs
@@ -13,56 +13,60 @@ import re
 from typing import Optional
 from fastapi import Request, HTTPException, status
 from fastapi.security import APIKeyHeader
+from twilio.request_validator import RequestValidator
 
 from ai_caller.config import get_settings
 
 settings = get_settings()
 
 # ── Twilio Signature Validation ──
+# Cached validator — auth_token doesn't change at runtime
+_twilio_validator: Optional[RequestValidator] = None
 
-def validate_twilio_signature(request: Request, auth_token: str) -> bool:
-    """Validate Twilio webhook request signature.
 
-    Twilio signs requests using HMAC-SHA1 of the full URL + sorted form params.
-    """
-    signature = request.headers.get("X-Twilio-Signature", "")
-    if not signature:
-        return False
-
-    url = str(request.url)
-    params = []
-
-    # For POST requests, include sorted form params
-    if request.method == "POST":
-        try:
-            body = request.state.body_cache
-            if isinstance(body, dict):
-                params = sorted(f"{k}{v}" for k, v in body.items())
-        except AttributeError:
-            pass
-
-    data = url + "".join(params)
-    expected = hmac.new(
-        auth_token.encode("utf-8"),
-        data.encode("utf-8"),
-        hashlib.sha1,
-    ).hexdigest()
-
-    return hmac.compare_digest(expected, signature)
+def _get_twilio_validator() -> RequestValidator:
+    global _twilio_validator
+    if _twilio_validator is None:
+        _twilio_validator = RequestValidator(settings.TWILIO_AUTH_TOKEN)
+    return _twilio_validator
 
 
 async def twilio_signature_middleware(request: Request, call_next):
-    """ASGI middleware to validate Twilio signatures on webhook endpoints."""
-    if request.url.path in ("/webhook/incoming", "/webhook/outbound", "/webhook/status"):
-        # Cache body for signature validation
-        body = await request.body()
-        request.state.body_cache = body
+    """ASGI middleware to validate Twilio signatures on webhook endpoints.
 
-        # Re-build request with cached body for downstream handlers
-        # Note: In production, use a proper body caching middleware
-        # This is a simplified version for demonstration
+    - Reads the body once (so downstream handlers can re-read via .body() / .form())
+    - Validates the X-Twilio-Signature against the raw body + full URL
+    - Rejects with 403 if signature is missing or invalid
+    - Skips validation for non-webhook paths (admin endpoints have their own auth)
+    """
+    WEBHOOK_PATHS = ("/webhook/incoming", "/webhook/outbound", "/webhook/status")
 
-        if not validate_twilio_signature(request, settings.TWILIO_AUTH_TOKEN):
+    if request.url.path in WEBHOOK_PATHS:
+        # Read body once and cache it; downstream handlers call .form() which
+        # re-derives from this cached body via FastAPI's request.body() impl.
+        body_bytes = await request.body()
+        request.state.body_cache = body_bytes
+
+        signature = request.headers.get("X-Twilio-Signature", "")
+        if not signature:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Missing X-Twilio-Signature header",
+            )
+
+        # Parse form params from the raw body for the validator
+        from urllib.parse import parse_qs
+        form_params = {}
+        if body_bytes:
+            parsed = parse_qs(body_bytes.decode("utf-8", errors="ignore"))
+            # Twilio validator expects {key: value} (not lists)
+            form_params = {k: v[0] for k, v in parsed.items()}
+
+        validator = _get_twilio_validator()
+        # Use the public URL Twilio signed against (request.url is fine for
+        # standard deployments; for proxies, set BASE_URL and override)
+        public_url = str(request.url)
+        if not validator.validate(public_url, form_params, signature):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Invalid Twilio signature",

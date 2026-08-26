@@ -29,6 +29,7 @@ from ai_caller.pipeline import CallPipeline
 from ai_caller.models import OutboundCallRequest, CallResponse, HealthResponse
 from ai_caller.security import verify_admin_api_key, redact_phone
 from ai_caller.middleware import logging_middleware, body_cache_middleware
+from ai_caller.security import twilio_signature_middleware
 from ai_caller.metrics import app_info, record_call, record_error, calls_active
 
 # ── Logging Setup ──
@@ -92,6 +93,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Twilio signature validation on inbound webhooks (must be added LAST so it wraps the others)
+app.middleware("http")(twilio_signature_middleware)
 
 # Prometheus metrics endpoint
 metrics_app = make_asgi_app()
