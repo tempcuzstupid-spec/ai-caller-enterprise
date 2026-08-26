@@ -304,9 +304,13 @@ async def health():
         overall_status = "degraded"
         stats = {"active_calls": 0, "total_calls": 0, "calls_today": 0}
 
-    # Check Twilio (lightweight)
+    # Check Twilio (lightweight) — use API version 2010-04-01 (the only stable one)
     try:
-        twilio_client.accounts(settings.TWILIO_ACCOUNT_SID).fetch()
+        # In twilio-python v9+, .accounts is a property returning a Version resource.
+        # The correct pattern is: client.api.v2010.accounts(sid).fetch()
+        # But the simpler validation is to fetch the account list, which uses
+        # the configured credentials without needing a per-call sid lookup.
+        twilio_client.api.v2010.accounts.list(limit=1)
         dependencies["twilio"] = "healthy"
     except Exception as exc:
         dependencies["twilio"] = f"unhealthy: {str(exc)}"
