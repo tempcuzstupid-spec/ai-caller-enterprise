@@ -1,36 +1,50 @@
 """AI Caller Platform — Enterprise FastAPI Entry Point.
 
-Security & Observability:
-  - Twilio webhook signature validation
+Architecture (HTTP-only, no WebSockets):
+  - Twilio <Gather input="speech"> captures the caller's voice
+  - Twilio's built-in STT transcribes it and POSTs to /webhook/conversation
+  - We call OpenAI with conversation history (persisted in Postgres)
+  - We return TwiML: <Say> the AI's reply + new <Gather>
+  - Twilio's built-in TTS plays the response, then the loop repeats
+  - Caller hangup -> /webhook/status with "completed" -> we clean up
+
+Why this architecture:
+  - Render's edge proxy (Cloudflare + istio-envoy) blocks WebSocket
+    upgrades to docker-runtime services. This is a platform-level
+    constraint we cannot bypass from inside the sandbox.
+  - <Gather> + <Say> puts all audio processing on Twilio's side —
+    same voice quality, zero WebSocket plumbing, works on any HTTP host.
+  - Trade-off: ~1-2s HTTP round-trip per turn (vs. <1s with WS).
+    Acceptable for a production voice agent.
+
+Features:
+  - Twilio webhook signature validation (HMAC-SHA1)
   - API key authentication for admin endpoints
-  - Rate limiting
   - Structured JSON logging
   - Prometheus metrics
-  - Circuit breakers for external APIs
-  - PII redaction
+  - PII redaction in logs
   - Request tracing
 """
 import json
 import logging
 import time
 from contextlib import asynccontextmanager
+from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Depends
+from fastapi import FastAPI, Request, Depends
 from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import make_asgi_app
 from twilio.rest import Client
-from twilio.twiml.voice_response import VoiceResponse, Connect
+from twilio.twiml.voice_response import VoiceResponse, Gather, Say
 
 from ai_caller.config import get_settings
 from ai_caller.database import init_pool, close_pool
 from ai_caller.store import call_store
-from ai_caller.pipeline import CallPipeline
 from ai_caller.models import OutboundCallRequest, CallResponse, HealthResponse
-from ai_caller.security import verify_admin_api_key, redact_phone
-from ai_caller.middleware import logging_middleware, body_cache_middleware
-from ai_caller.security import verify_twilio_signature
-from ai_caller.metrics import app_info, record_call, record_error, calls_active
+from ai_caller.security import verify_admin_api_key, verify_twilio_signature, redact_phone
+from ai_caller.metrics import app_info, record_call, record_error
+from ai_caller import voice
 
 # ── Logging Setup ──
 logging.basicConfig(
@@ -42,35 +56,20 @@ logger = logging.getLogger("ai_caller")
 # ── Globals ──
 settings = get_settings()
 twilio_client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
-active_pipelines: dict[str, CallPipeline] = {}
 
 app_info.info({"version": "1.0.0", "env": settings.ENV})
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: init DB pool (resilient). Shutdown: close everything gracefully.
-
-    DB init failure does not crash the app — the service stays up and
-    returns a degraded /health response so Render's health check still
-    passes. This lets us deploy with placeholder secrets and swap them
-    in without re-deploying.
-    """
-    logger.info(f"🚀 AI Caller Enterprise starting | ENV={settings.ENV} | BASE_URL={settings.BASE_URL}")
+    """Startup: init DB pool (resilient). Shutdown: close everything."""
+    logger.info(f"AI Caller Enterprise starting | ENV={settings.ENV} | BASE_URL={settings.BASE_URL}")
     try:
         await init_pool()
     except Exception as exc:
-        logger.error(
-            f"⚠️ Database init failed (continuing in degraded mode): {exc}",
-            exc_info=True,
-        )
+        logger.error(f"DB init failed (continuing in degraded mode): {exc}", exc_info=True)
     yield
-    logger.info("👋 AI Caller Enterprise shutting down")
-    for pipeline in list(active_pipelines.values()):
-        try:
-            await pipeline.close()
-        except Exception as exc:
-            logger.warning(f"Pipeline close error: {exc}")
+    logger.info("AI Caller Enterprise shutting down")
     try:
         await close_pool()
     except Exception as exc:
@@ -94,13 +93,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Prometheus metrics endpoint
+# Prometheus metrics
 metrics_app = make_asgi_app()
 app.mount("/metrics", metrics_app)
 
 
 # ═══════════════════════════════════════════════════════════════
-# Twilio Webhooks (with signature validation)
+# Twilio Webhooks
 # ═══════════════════════════════════════════════════════════════
 
 @app.post("/webhook/incoming")
@@ -108,7 +107,7 @@ async def incoming_call_webhook(
     request: Request,
     _sig: None = Depends(verify_twilio_signature),
 ):
-    """Twilio inbound call webhook. Signature validated via dependency."""
+    """Inbound call: greet, then start the conversation loop."""
     form = await request.form()
     call_sid = form.get("CallSid")
     from_number = form.get("From", "unknown")
@@ -119,14 +118,18 @@ async def incoming_call_webhook(
         direction="inbound",
         purpose="general",
     )
+    # Seed the conversation history with the greeting
+    await call_store.add_transcript(call_sid, "assistant", voice.get_greeting("general"))
     record_call("inbound", "general", "initiated")
-    logger.info(f"[Webhook] Incoming call | sid={call_sid} from={redact_phone(from_number)}")
+    logger.info(f"[Webhook] Incoming | sid={call_sid} from={redact_phone(from_number)}")
 
-    response = VoiceResponse()
-    connect = Connect()
-    connect.stream(url=f"{settings.BASE_URL}/ws/media-stream")
-    response.append(connect)
-    return Response(content=str(response), media_type="application/xml")
+    # Build the initial TwiML: say the greeting, then start gathering
+    conversation_url = f"{settings.BASE_URL}/webhook/conversation?call_sid={call_sid}&purpose=general"
+    twiml = voice.build_response_twiml(
+        say_text=voice.get_greeting("general"),
+        gather_action_url=conversation_url,
+    )
+    return Response(content=twiml, media_type="application/xml")
 
 
 @app.post("/webhook/outbound")
@@ -134,17 +137,112 @@ async def outbound_call_webhook(
     request: Request,
     _sig: None = Depends(verify_twilio_signature),
 ):
-    """Twilio outbound call connect webhook."""
+    """Outbound call: called when the callee answers. Starts the conversation."""
     form = await request.form()
     call_sid = form.get("CallSid")
-    await call_store.update(call_sid, status="answered")
-    logger.info(f"[Webhook] Outbound answered | sid={call_sid}")
 
-    response = VoiceResponse()
-    connect = Connect()
-    connect.stream(url=f"{settings.BASE_URL}/ws/media-stream")
-    response.append(connect)
-    return Response(content=str(response), media_type="application/xml")
+    # Look up the call to get purpose + context
+    call_state = await call_store.get(call_sid)
+    purpose = call_state.purpose if call_state else "general"
+    context = call_state.context if call_state else ""
+    await call_store.update(call_sid, status="in-progress")
+    record_call("outbound", purpose, "answered")
+    logger.info(f"[Webhook] Outbound answered | sid={call_sid} purpose={purpose}")
+
+    # Build the conversation history + greeting
+    greeting = voice.get_greeting(purpose, context)
+    await call_store.add_transcript(call_sid, "assistant", greeting)
+
+    conversation_url = (
+        f"{settings.BASE_URL}/webhook/conversation"
+        f"?call_sid={call_sid}&purpose={purpose}"
+    )
+    twiml = voice.build_response_twiml(
+        say_text=greeting,
+        gather_action_url=conversation_url,
+    )
+    return Response(content=twiml, media_type="application/xml")
+
+
+@app.post("/webhook/conversation")
+async def conversation_turn(
+    request: Request,
+    _sig: None = Depends(verify_twilio_signature),
+):
+    """Each turn of the conversation loop.
+
+    Twilio POSTs the caller's transcribed speech here. We:
+      1. Read the prior conversation history from the DB
+      2. Call OpenAI to generate a response
+      3. Persist the new user + assistant messages
+      4. Return TwiML: <Say> the response + new <Gather>
+    """
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    user_speech = (form.get("SpeechResult") or "").strip()
+    digits = (form.get("Digits") or "").strip()
+
+    # If the gather timed out with no speech, user_speech is empty
+    if not user_speech and not digits:
+        # Re-prompt with a new gather
+        conversation_url = f"{settings.BASE_URL}/webhook/conversation?call_sid={call_sid}"
+        twiml = voice.build_response_twiml(
+            say_text="",
+            gather_action_url=conversation_url,
+        )
+        # The build_response_twiml already handles the empty-say case by
+        # just doing the gather + fallback. But we need a real "say" — let's
+        # return a minimal gather-only TwiML
+        resp = VoiceResponse()
+        resp.append(Gather(
+            input="speech",
+            action=conversation_url,
+            method="POST",
+            language="en-US",
+            speech_timeout="auto",
+            timeout=10,
+        ))
+        resp.say("I didn't catch that. Goodbye!", voice="alice", language="en-US")
+        resp.hangup()
+        return Response(content=str(resp), media_type="application/xml")
+
+    user_text = user_speech or f"[dtmf:{digits}]"
+    logger.info(f"[Conv] {call_sid} user: {user_text[:120]}")
+
+    # Load call state to get purpose
+    call_state = await call_store.get(call_sid)
+    purpose = (call_state.purpose if call_state else "general") or "general"
+    context = (call_state.context if call_state else "") or ""
+
+    # Load full transcript history
+    history = await call_store.get_transcript(call_sid)
+    messages = voice.build_initial_messages(purpose, context)
+    # Append all prior user/assistant turns (skip the seeded greeting already
+    # in the system messages)
+    for turn in history:
+        if turn["role"] in ("user", "assistant"):
+            messages.append({"role": turn["role"], "content": turn["content"]})
+
+    # Persist the user's turn
+    await call_store.add_transcript(call_sid, "user", user_text)
+
+    # Generate the AI response
+    ai_text = await voice.generate_ai_response(messages, call_sid)
+    logger.info(f"[Conv] {call_sid} ai:   {ai_text[:120]}")
+
+    # Persist the assistant's turn
+    await call_store.add_transcript(call_sid, "assistant", ai_text)
+
+    # Check if the user wants to end the call
+    end_call = voice.should_end_call(user_text, ai_text)
+
+    conversation_url = f"{settings.BASE_URL}/webhook/conversation?call_sid={call_sid}&purpose={purpose}"
+    twiml = voice.build_response_twiml(
+        say_text=ai_text,
+        gather_action_url=conversation_url,
+        end_call=end_call,
+    )
+    return Response(content=twiml, media_type="application/xml")
 
 
 @app.post("/webhook/status")
@@ -152,33 +250,27 @@ async def call_status_webhook(
     request: Request,
     _sig: None = Depends(verify_twilio_signature),
 ):
-    """Twilio call status callbacks."""
+    """Call status callbacks: ring, answer, complete, etc."""
     form = await request.form()
     call_sid = form.get("CallSid")
-    status = form.get("CallStatus")
+    call_status = form.get("CallStatus")
     duration = form.get("CallDuration")
 
-    update = {"status": status}
+    update = {"status": call_status}
     if duration:
-        try: update["duration"] = int(duration)
-        except ValueError: pass
+        try:
+            update["duration"] = int(duration)
+        except ValueError:
+            pass
 
     await call_store.update(call_sid, **update)
-    record_call("unknown", "general", status)
-    logger.info(f"[Webhook] Status | sid={call_sid} status={status}")
-
-    if status in ("completed", "failed", "busy", "no-answer", "canceled"):
-        for stream_sid, pipeline in list(active_pipelines.items()):
-            if pipeline.call_state.call_sid == call_sid:
-                await pipeline.close()
-                active_pipelines.pop(stream_sid, None)
-                break
-
+    record_call("unknown", "general", call_status)
+    logger.info(f"[Webhook] Status | sid={call_sid} status={call_status}")
     return Response(status_code=200)
 
 
 # ═══════════════════════════════════════════════════════════════
-# Outbound Call API (with auth & validation)
+# Outbound Call API
 # ═══════════════════════════════════════════════════════════════
 
 @app.post("/call", response_model=CallResponse)
@@ -205,7 +297,9 @@ async def trigger_outbound_call(
         context=body.context,
     )
     record_call("outbound", body.purpose, "initiated")
-    logger.info(f"[API] Outbound call | sid={call.sid} to={redact_phone(body.to)} purpose={body.purpose}")
+    logger.info(
+        f"[API] Outbound | sid={call.sid} to={redact_phone(body.to)} purpose={body.purpose}"
+    )
 
     return CallResponse(
         success=True,
@@ -217,94 +311,15 @@ async def trigger_outbound_call(
 
 
 # ═══════════════════════════════════════════════════════════════
-# Media Stream WebSocket
-# ═══════════════════════════════════════════════════════════════
-
-@app.websocket("/ws/media-stream")
-async def media_stream(websocket: WebSocket):
-    """Bidirectional WebSocket for real-time audio streaming."""
-    await websocket.accept()
-    pipeline: CallPipeline | None = None
-    stream_sid: str | None = None
-
-    try:
-        while True:
-            message = await websocket.receive_text()
-            data = json.loads(message)
-            event = data.get("event")
-
-            if event == "connected":
-                logger.debug("[WS] Twilio connected")
-                continue
-
-            if event == "start":
-                start_data = data["start"]
-                stream_sid = start_data["streamSid"]
-                call_sid = start_data["callSid"]
-
-                call_state = await call_store.get(call_sid)
-                if not call_state:
-                    call_state = await call_store.create(
-                        call_sid=call_sid,
-                        phone_number="unknown",
-                        direction="inbound",
-                    )
-
-                await call_store.update(call_sid, status="in-progress", stream_sid=stream_sid)
-
-                pipeline = CallPipeline(
-                    call_state=call_state,
-                    stream_sid=stream_sid,
-                    websocket=websocket,
-                    deepgram_key=settings.DEEPGRAM_API_KEY,
-                    openai_key=settings.OPENAI_API_KEY,
-                    eleven_key=settings.ELEVENLABS_API_KEY,
-                    eleven_voice=settings.ELEVENLABS_VOICE_ID,
-                )
-                active_pipelines[stream_sid] = pipeline
-                await pipeline.start()
-                logger.info(f"[WS] Call started | sid={call_sid} purpose={call_state.purpose}")
-                continue
-
-            if event == "media" and pipeline:
-                await pipeline.handle_media(data["media"]["payload"])
-                continue
-
-            if event == "stop":
-                logger.info(f"[WS] Stream stopped | sid={stream_sid}")
-                if pipeline:
-                    await pipeline.close()
-                if stream_sid:
-                    active_pipelines.pop(stream_sid, None)
-                break
-
-    except WebSocketDisconnect:
-        logger.info(f"[WS] Disconnected | sid={stream_sid}")
-    except Exception as exc:
-        record_error("websocket", type(exc).__name__)
-        logger.error(f"[WS] Error | sid={stream_sid} exc={exc}")
-    finally:
-        if pipeline:
-            await pipeline.close()
-        if stream_sid:
-            active_pipelines.pop(stream_sid, None)
-
-
-# ═══════════════════════════════════════════════════════════════
-# Utilities & Monitoring
+# Health, Calls, Transcripts, Metrics
 # ═══════════════════════════════════════════════════════════════
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
-    """Deep health check with dependency validation.
-
-    Returns 200 even when degraded so Render's health check passes while
-    secrets are being filled in. Status field reports "ok" or "degraded".
-    """
+    """Deep health check. Returns 200 with status='ok' or 'degraded'."""
     dependencies = {"database": "unknown", "twilio": "unknown"}
     overall_status = "ok"
 
-    # Check database
     try:
         stats = await call_store.get_call_stats()
         dependencies["database"] = "healthy"
@@ -314,12 +329,7 @@ async def health():
         overall_status = "degraded"
         stats = {"active_calls": 0, "total_calls": 0, "calls_today": 0}
 
-    # Check Twilio (lightweight) — use API version 2010-04-01 (the only stable one)
     try:
-        # In twilio-python v9+, .accounts is a property returning a Version resource.
-        # The correct pattern is: client.api.v2010.accounts(sid).fetch()
-        # But the simpler validation is to fetch the account list, which uses
-        # the configured credentials without needing a per-call sid lookup.
         twilio_client.api.v2010.accounts.list(limit=1)
         dependencies["twilio"] = "healthy"
     except Exception as exc:
@@ -337,7 +347,7 @@ async def health():
 
 @app.get("/calls")
 async def list_calls(_=Depends(verify_admin_api_key)):
-    """List all active calls. Requires admin API key."""
+    """List active calls. Requires admin API key."""
     calls = await call_store.list_active()
     return {
         "active_calls": len(calls),
@@ -357,7 +367,7 @@ async def list_calls(_=Depends(verify_admin_api_key)):
 
 @app.get("/calls/{call_sid}/transcript")
 async def get_transcript(call_sid: str, _=Depends(verify_admin_api_key)):
-    """Get call transcript. Requires admin API key."""
+    """Get full call transcript. Requires admin API key."""
     state = await call_store.get(call_sid)
     if not state:
         return JSONResponse({"error": "Call not found"}, status_code=404)

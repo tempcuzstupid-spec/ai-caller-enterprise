@@ -19,11 +19,8 @@ class Settings(BaseSettings):
     TWILIO_WEBHOOK_SECRET: str = ""  # Optional: for enhanced signature validation
 
     # AI Services
-    DEEPGRAM_API_KEY: str
     OPENAI_API_KEY: str
     OPENAI_MODEL: str = "gpt-4o"
-    ELEVENLABS_API_KEY: str
-    ELEVENLABS_VOICE_ID: str = "EXAVITQu4vr4xnSDxMaL"
 
     # Security
     API_KEY_HEADER: str = "X-API-Key"
