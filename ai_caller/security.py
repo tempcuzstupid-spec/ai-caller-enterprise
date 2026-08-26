@@ -31,49 +31,38 @@ def _get_twilio_validator() -> RequestValidator:
     return _twilio_validator
 
 
-async def twilio_signature_middleware(request: Request, call_next):
-    """ASGI middleware to validate Twilio signatures on webhook endpoints.
+async def verify_twilio_signature(request: Request) -> None:
+    """FastAPI dependency: validate Twilio webhook signature.
 
-    - Reads the body once (so downstream handlers can re-read via .body() / .form())
-    - Validates the X-Twilio-Signature against the raw body + full URL
-    - Rejects with 403 if signature is missing or invalid
-    - Skips validation for non-webhook paths (admin endpoints have their own auth)
+    Use as `Depends(verify_twilio_signature)` on any webhook endpoint.
+    Reads the form, validates, and lets Starlette re-use the cached body
+    for downstream `await request.form()` calls.
     """
-    WEBHOOK_PATHS = ("/webhook/incoming", "/webhook/outbound", "/webhook/status")
+    signature = request.headers.get("X-Twilio-Signature", "")
+    if not signature:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Missing X-Twilio-Signature header",
+        )
 
-    if request.url.path in WEBHOOK_PATHS:
-        # Read body once and cache it; downstream handlers call .form() which
-        # re-derives from this cached body via FastAPI's request.body() impl.
-        body_bytes = await request.body()
-        request.state.body_cache = body_bytes
+    # Reading form() forces Starlette to consume + cache the body. Subsequent
+    # .form() calls in the endpoint re-derive from this cache.
+    form = await request.form()
 
-        signature = request.headers.get("X-Twilio-Signature", "")
-        if not signature:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Missing X-Twilio-Signature header",
-            )
+    # Pass the form directly — Starlette's FormData is dict-like and the
+    # validator handles MultiDict via get_values().
+    validator = _get_twilio_validator()
+    public_url = str(request.url)
+    if not validator.validate(public_url, dict(form), signature):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid Twilio signature",
+        )
 
-        # Parse form params from the raw body for the validator
-        from urllib.parse import parse_qs
-        form_params = {}
-        if body_bytes:
-            parsed = parse_qs(body_bytes.decode("utf-8", errors="ignore"))
-            # Twilio validator expects {key: value} (not lists)
-            form_params = {k: v[0] for k, v in parsed.items()}
 
-        validator = _get_twilio_validator()
-        # Use the public URL Twilio signed against (request.url is fine for
-        # standard deployments; for proxies, set BASE_URL and override)
-        public_url = str(request.url)
-        if not validator.validate(public_url, form_params, signature):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Invalid Twilio signature",
-            )
-
-    response = await call_next(request)
-    return response
+async def twilio_signature_middleware(request: Request, call_next):
+    """No-op kept for backwards compat. Real validation is via dependency."""
+    return await call_next(request)
 
 
 # ── API Key Authentication ──
