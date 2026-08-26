@@ -49,10 +49,15 @@ async def verify_twilio_signature(request: Request) -> None:
     # .form() calls in the endpoint re-derive from this cache.
     form = await request.form()
 
+    # Use the configured BASE_URL (what Twilio actually signed against) instead
+    # of request.url — Render's proxy may rewrite host/scheme, breaking sig.
+    public_url = settings.BASE_URL.rstrip("/") + request.url.path
+    if request.url.query:
+        public_url += "?" + request.url.query
+
     # Pass the form directly — Starlette's FormData is dict-like and the
     # validator handles MultiDict via get_values().
     validator = _get_twilio_validator()
-    public_url = str(request.url)
     if not validator.validate(public_url, dict(form), signature):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
