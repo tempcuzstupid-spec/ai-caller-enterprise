@@ -12,6 +12,7 @@ Security & Observability:
 """
 import json
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 
@@ -124,7 +125,10 @@ async def incoming_call_webhook(
 
     response = VoiceResponse()
     connect = Connect()
-    connect.stream(url=f"{settings.BASE_URL}/ws/media-stream")
+    # WebSocket URL points to the VPS (bypasses Fly's broken istio-envoy proxy).
+    # Override WS_GATEWAY_URL env var to change.
+    ws_url = os.getenv("WS_GATEWAY_URL", "wss://ws.coastalvanguard.org/ws")
+    connect.stream(url=ws_url)
     response.append(connect)
     return Response(content=str(response), media_type="application/xml")
 
@@ -142,7 +146,9 @@ async def outbound_call_webhook(
 
     response = VoiceResponse()
     connect = Connect()
-    connect.stream(url=f"{settings.BASE_URL}/ws/media-stream")
+    # WebSocket URL points to the VPS (bypasses Fly's broken istio-envoy proxy).
+    ws_url = os.getenv("WS_GATEWAY_URL", "wss://ws.coastalvanguard.org/ws")
+    connect.stream(url=ws_url)
     response.append(connect)
     return Response(content=str(response), media_type="application/xml")
 

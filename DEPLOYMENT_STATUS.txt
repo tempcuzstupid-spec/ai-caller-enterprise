@@ -1,0 +1,50 @@
+═══════════════════════════════════════════════════════════════
+  AI CALLER — DEPLOYMENT STATUS (2026-08-27)
+═══════════════════════════════════════════════════════════════
+
+VPS — ai-caller-ws-gateway-nyc1
+─────────────────────────────────────────────────────────────
+  IP:           159.65.217.200
+  Region:       nyc1 (New York, DigitalOcean)
+  Cost:         $6/mo
+  OS:           Ubuntu 24.04 LTS x64
+  SSH Key:      ai-caller-vps-mavis (id 58842858, ed25519)
+  Specs:        1 vCPU, 1GB RAM, 25GB SSD
+  Installed:    nginx 1.24, certbot, python 3.12, ffmpeg, ufw
+  UFW:          22, 80, 443 open
+  Status:       nginx running, WebSocket server NOT YET DEPLOYED
+
+Code Built (not yet deployed to VPS)
+─────────────────────────────────────────────────────────────
+  /workspace/ai-caller/ws_gateway.py
+    - FastAPI app on 127.0.0.1:8765
+    - WebSocket /ws accepts Twilio media stream
+    - Deepgram STT (nova-2, mulaw 8000)
+    - OpenAI LLM (gpt-4o-mini)
+    - ElevenLabs TTS (Rachel voice, ulaw 8000)
+    - Saves transcript back to Fly at call end
+
+Missing for full deployment
+─────────────────────────────────────────────────────────────
+  ✗ Domain:  ws.dahliastrategic.com DNS A record -> 159.65.217.200
+  ✗ API Keys needed on VPS:
+      - DEEPGRAM_API_KEY
+      - OPENAI_API_KEY
+      - ELEVENLABS_API_KEY
+      - ELEVENLABS_VOICE_ID (optional, default Rachel)
+      - FLY_ADMIN_KEY (to save transcripts back to Fly)
+
+Next Steps
+─────────────────────────────────────────────────────────────
+  1. User updates Squarespace DNS:
+     ws.dahliastrategic.com -> 159.65.217.200
+  2. User pastes the 4-5 API keys in chat
+  3. I write the keys to /opt/ai-caller-ws/.env on the VPS
+  4. I install the WebSocket server as a systemd service
+  5. I configure nginx reverse proxy + certbot SSL
+  6. I update the Fly app's TwiML to point to wss://ws.dahliastrategic.com/ws
+  7. I switch Twilio's webhook from Render to Fly
+  8. User dials +17868285473 and hears the AI speak
+
+Status: VPS up. Code written. Waiting on user for DNS + keys.
+═══════════════════════════════════════════════════════════════
