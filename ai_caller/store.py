@@ -30,15 +30,18 @@ class PostgresStore:
         direction: str,
         purpose: str = "general",
         context: str = "",
+        line: str = "unknown",
+        caller_id: str = None,
+        lead_name: str = None,
     ) -> CallState:
         async with get_conn() as conn:
             await conn.execute(
                 """
-                INSERT INTO calls (call_sid, phone_number, direction, purpose, context)
-                VALUES ($1, $2, $3, $4, $5)
+                INSERT INTO calls (call_sid, phone_number, direction, purpose, context, line, caller_id, lead_name)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 ON CONFLICT (call_sid) DO NOTHING
                 """,
-                call_sid, phone_number, direction, purpose, context,
+                call_sid, phone_number, direction, purpose, context, line, caller_id, lead_name,
             )
         return CallState(
             call_sid=call_sid, phone_number=phone_number,

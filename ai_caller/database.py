@@ -21,16 +21,25 @@ CREATE TABLE IF NOT EXISTS calls (
     status          VARCHAR(32) NOT NULL DEFAULT 'initiated',
     stream_sid      VARCHAR(64),
     duration        INTEGER,
+    line            VARCHAR(32) NOT NULL DEFAULT 'unknown',
+    caller_id       VARCHAR(32),
+    lead_name       VARCHAR(128),
     started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     ended_at        TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Migration: add columns if they don't exist (for existing tables)
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS line VARCHAR(32) NOT NULL DEFAULT 'unknown';
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS caller_id VARCHAR(32);
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS lead_name VARCHAR(128);
+
 CREATE INDEX IF NOT EXISTS idx_calls_sid ON calls(call_sid);
 CREATE INDEX IF NOT EXISTS idx_calls_status ON calls(status);
 CREATE INDEX IF NOT EXISTS idx_calls_started ON calls(started_at);
 CREATE INDEX IF NOT EXISTS idx_calls_phone ON calls(phone_number);
+CREATE INDEX IF NOT EXISTS idx_calls_line ON calls(line);
 
 CREATE TABLE IF NOT EXISTS transcripts (
     id          SERIAL PRIMARY KEY,

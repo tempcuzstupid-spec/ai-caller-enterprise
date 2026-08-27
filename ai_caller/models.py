@@ -6,8 +6,11 @@ from typing import Optional, Literal
 class OutboundCallRequest(BaseModel):
     """Validated request body for triggering outbound calls."""
     to: str = Field(..., pattern=r"^\+\d{10,15}$", description="E.164 phone number")
-    purpose: Literal["general", "sales_demo", "support", "reminder", "personal_assistant"] = "general"
+    purpose: Literal["general", "sales_demo", "support", "reminder", "personal_assistant", "lead_qualification", "sales_close", "appointment"] = "general"
     context: str = Field(default="", max_length=2000, description="Additional context for the AI")
+    tz: str = Field(default="America/New_York", description="IANA timezone for the lead (used for calling-hours compliance)")
+    lead_name: Optional[str] = Field(default=None, description="Lead's name (for personalized greeting)")
+    lead_context: Optional[str] = Field(default=None, description="Specific context about this lead (e.g. 'showed interest in retatrutide')")
 
     @field_validator("to")
     @classmethod
@@ -20,11 +23,12 @@ class OutboundCallRequest(BaseModel):
 class CallResponse(BaseModel):
     """Response model for call operations."""
     success: bool
-    call_sid: str
+    call_sid: Optional[str] = None
     to: str
     purpose: str
     status: str
     message: Optional[str] = None
+    caller_id: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
