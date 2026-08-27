@@ -133,6 +133,108 @@ async def incoming_call_webhook(
     return Response(content=str(response), media_type="application/xml")
 
 
+@app.post("/webhook/incoming-conversation")
+async def incoming_conversation_webhook(
+    request: Request,
+    _sig: None = Depends(verify_twilio_signature),
+):
+    """Miami inbound — ConversationRelay (barge-in native)."""
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    from_number = form.get("From", "unknown")
+
+    await call_store.create(
+        call_sid=call_sid,
+        phone_number=from_number,
+        direction="inbound",
+        purpose="general",
+        line="miami-786-conversation",
+    )
+    record_call("inbound", "general", "initiated")
+    logger.info(f"[Webhook] Incoming (miami-786-conversation) | sid={call_sid} from={redact_phone(from_number)}")
+
+    response = VoiceResponse()
+    connect = Connect()
+    # ConversationRelay with ElevenLabs voice (selected on Twilio side)
+    ws_url = os.getenv("WS_GATEWAY_URL_CONVERSATION", "wss://ws.coastalvanguard.org/ws/conversation?persona=support")
+    connect.conversation_relay(
+        url=ws_url,
+        ttsProvider="ElevenLabs",
+        voice="EXAVITQu4vr4xnSDxMaL",  # Rachel
+        transcriptionProvider="Deepgram",
+        speechModel="nova-3-general",
+        interruptible="any",
+        interruptSensitivity="medium",
+        welcomeGreeting="Hi, this is the AI assistant. How can I help you today?",
+    )
+    response.append(connect)
+    return Response(content=str(response), media_type="application/xml")
+
+
+@app.post("/webhook/incoming-support-conversation")
+async def incoming_support_conversation_webhook(
+    request: Request,
+    _sig: None = Depends(verify_twilio_signature),
+):
+    """Toll-free (888) — ConversationRelay with Marcus voice (formal corporate)."""
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    from_number = form.get("From", "unknown")
+
+    await call_store.create(
+        call_sid=call_sid,
+        phone_number=from_number,
+        direction="inbound",
+        purpose="customer_service",
+        line="tollfree-888-conversation",
+    )
+    record_call("inbound", "customer_service", "initiated")
+    logger.info(f"[Webhook] Incoming (tollfree-888-conversation) | sid={call_sid} from={redact_phone(from_number)}")
+
+    response = VoiceResponse()
+    connect = Connect()
+    ws_url = "wss://ws.coastalvanguard.org/ws/conversation?persona=tollfree"
+    connect.conversation_relay(
+        url=ws_url,
+        ttsProvider="ElevenLabs",
+        voice="TxGEqnHWrfWFTfGW9XjX",  # Josh
+        transcriptionProvider="Deepgram",
+        speechModel="nova-3-general",
+        interruptible="any",
+        interruptSensitivity="medium",
+        welcomeGreeting="Thank you for calling Coastal Vanguard. This is Marcus. How may I assist you today?",
+    )
+    response.append(connect)
+    return Response(content=str(response), media_type="application/xml")
+
+
+@app.post("/webhook/outbound-conversation")
+async def outbound_conversation_webhook(
+    request: Request,
+    _sig: None = Depends(verify_twilio_signature),
+):
+    """Outbound sales — ConversationRelay with sales persona."""
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    await call_store.update(call_sid, status="answered")
+    logger.info(f"[Webhook] Outbound conversation answered | sid={call_sid}")
+
+    response = VoiceResponse()
+    connect = Connect()
+    ws_url = "wss://ws.coastalvanguard.org/ws/conversation?persona=sales"
+    connect.conversation_relay(
+        url=ws_url,
+        ttsProvider="ElevenLabs",
+        voice="TxGEqnHWrfWFTfGW9XjX",  # Josh
+        transcriptionProvider="Deepgram",
+        speechModel="nova-3-general",
+        interruptible="any",
+        interruptSensitivity="medium",
+    )
+    response.append(connect)
+    return Response(content=str(response), media_type="application/xml")
+
+
 @app.post("/webhook/incoming-support")
 async def incoming_support_webhook(
     request: Request,
