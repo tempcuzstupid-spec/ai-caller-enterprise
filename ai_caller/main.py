@@ -324,7 +324,7 @@ async def trigger_outbound_call(
     call = twilio_client.calls.create(
         to=body.to,
         from_=caller_id,
-        url=f"{settings.BASE_URL}/webhook/outbound",  # When lead answers, gets sales TwiML
+        url=f"{settings.BASE_URL}/webhook/outbound-conversation",  # When lead answers, gets ConversationRelay TwiML
         status_callback=f"{settings.BASE_URL}/webhook/outbound-status",  # Status events
         status_callback_event=["initiated", "ringing", "answered", "completed"],
         status_callback_method="POST",
