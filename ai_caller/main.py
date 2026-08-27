@@ -109,66 +109,16 @@ async def incoming_call_webhook(
     request: Request,
     _sig: None = Depends(verify_twilio_signature),
 ):
-    """Twilio inbound call webhook. Miami number (786) — Rachel support AI."""
+    """Twilio inbound call webhook. Miami 786 number is RESERVED for the
+    future AI Assistant project — DO NOT repurpose for support/sales.
+    This route is kept as a no-op stub that just 200s so the webhook
+    validates. The AI Assistant project will replace this handler.
+    """
     form = await request.form()
     call_sid = form.get("CallSid")
     from_number = form.get("From", "unknown")
-
-    await call_store.create(
-        call_sid=call_sid,
-        phone_number=from_number,
-        direction="inbound",
-        purpose="general",
-        line="miami-786",
-    )
-    record_call("inbound", "general", "initiated")
-    logger.info(f"[Webhook] Incoming (miami-786) | sid={call_sid} from={redact_phone(from_number)}")
-
-    response = VoiceResponse()
-    connect = Connect()
-    # WebSocket URL points to the VPS (bypasses Fly's broken istio-envoy proxy).
-    ws_url = os.getenv("WS_GATEWAY_URL", "wss://ws.coastalvanguard.org/ws")
-    connect.stream(url=ws_url)
-    response.append(connect)
-    return Response(content=str(response), media_type="application/xml")
-
-
-@app.post("/webhook/incoming-conversation")
-async def incoming_conversation_webhook(
-    request: Request,
-    _sig: None = Depends(verify_twilio_signature),
-):
-    """Miami inbound — ConversationRelay (barge-in native)."""
-    form = await request.form()
-    call_sid = form.get("CallSid")
-    from_number = form.get("From", "unknown")
-
-    await call_store.create(
-        call_sid=call_sid,
-        phone_number=from_number,
-        direction="inbound",
-        purpose="general",
-        line="miami-786-conversation",
-    )
-    record_call("inbound", "general", "initiated")
-    logger.info(f"[Webhook] Incoming (miami-786-conversation) | sid={call_sid} from={redact_phone(from_number)}")
-
-    response = VoiceResponse()
-    connect = Connect()
-    # ConversationRelay with ElevenLabs voice (selected on Twilio side)
-    ws_url = os.getenv("WS_GATEWAY_URL_CONVERSATION", "wss://ws.coastalvanguard.org/ws/conversation?persona=support")
-    connect.conversation_relay(
-        url=ws_url,
-        ttsProvider="ElevenLabs",
-        voice="EXAVITQu4vr4xnSDxMaL",  # Rachel
-        transcriptionProvider="Deepgram",
-        speechModel="nova-3-general",
-        interruptible="any",
-        interruptSensitivity="medium",
-        welcomeGreeting="Hi, this is the AI assistant. How can I help you today?",
-    )
-    response.append(connect)
-    return Response(content=str(response), media_type="application/xml")
+    logger.info(f"[Webhook] Miami 786 received call (reserved for AI Assistant project) | sid={call_sid} from={redact_phone(from_number)}")
+    return Response(status_code=200)
 
 
 @app.post("/webhook/incoming-support-conversation")
@@ -231,55 +181,6 @@ async def outbound_conversation_webhook(
         interruptible="any",
         interruptSensitivity="medium",
     )
-    response.append(connect)
-    return Response(content=str(response), media_type="application/xml")
-
-
-@app.post("/webhook/incoming-support")
-async def incoming_support_webhook(
-    request: Request,
-    _sig: None = Depends(verify_twilio_signature),
-):
-    """Toll-free (888) — different persona (Marcus, formal corporate)."""
-    form = await request.form()
-    call_sid = form.get("CallSid")
-    from_number = form.get("From", "unknown")
-
-    await call_store.create(
-        call_sid=call_sid,
-        phone_number=from_number,
-        direction="inbound",
-        purpose="customer_service",
-        line="tollfree-888",
-    )
-    record_call("inbound", "customer_service", "initiated")
-    logger.info(f"[Webhook] Incoming (tollfree-888) | sid={call_sid} from={redact_phone(from_number)}")
-
-    response = VoiceResponse()
-    connect = Connect()
-    # Different WebSocket path for toll-free persona
-    ws_url = os.getenv("WS_GATEWAY_URL_SUPPORT", "wss://ws.coastalvanguard.org/ws/support")
-    connect.stream(url=ws_url)
-    response.append(connect)
-    return Response(content=str(response), media_type="application/xml")
-
-
-@app.post("/webhook/outbound")
-async def outbound_call_webhook(
-    request: Request,
-    _sig: None = Depends(verify_twilio_signature),
-):
-    """Twilio outbound call connect webhook — when the AI dials a lead, the lead answers, Twilio hits this to get the Stream URL."""
-    form = await request.form()
-    call_sid = form.get("CallSid")
-    await call_store.update(call_sid, status="answered")
-    logger.info(f"[Webhook] Outbound answered | sid={call_sid}")
-
-    response = VoiceResponse()
-    connect = Connect()
-    # Sales WebSocket path
-    ws_url = os.getenv("WS_GATEWAY_URL_SALES", "wss://ws.coastalvanguard.org/ws/sales")
-    connect.stream(url=ws_url)
     response.append(connect)
     return Response(content=str(response), media_type="application/xml")
 
