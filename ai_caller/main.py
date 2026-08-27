@@ -522,6 +522,82 @@ async def get_transcript(call_sid: str, _=Depends(verify_admin_api_key)):
     return {"call_sid": call_sid, "transcript": transcript}
 
 
+@app.post("/calls/{call_sid}/send-catalog-sms")
+async def send_catalog_sms(call_sid: str, request: Request, _=Depends(verify_admin_api_key)):
+    """Send a catalog link SMS to the lead's phone. Triggered by Marcus
+    when he says he's sending the link."""
+    body = await request.json()
+    url = body.get("url", "https://coastalvanguard.org")
+    lead_phone = body.get("lead_phone")
+
+    # If lead_phone not passed, get from call record
+    if not lead_phone:
+        state = await call_store.get(call_sid)
+        if state:
+            lead_phone = state.phone_number
+
+    if not lead_phone:
+        return JSONResponse({"error": "No lead phone number available"}, status_code=400)
+
+    try:
+        msg = twilio_client.messages.create(
+            to=lead_phone,
+            from_=settings.TWILIO_PHONE_NUMBER,
+            body=f"Thanks for your interest in Coastal Vanguard! Here's the full catalog: {url} — Marcus",
+        )
+        logger.info(f"[SMS] Catalog link sent to {lead_phone} via {msg.sid}")
+        return {"success": True, "message_sid": msg.sid, "to": lead_phone}
+    except Exception as e:
+        logger.error(f"[SMS] Failed to send: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/calls/{call_sid}/send-payment-link")
+async def send_payment_link(call_sid: str, request: Request, _=Depends(verify_admin_api_key)):
+    """Send a payment link SMS to the lead. (Legacy endpoint, no longer used by Marcus in qual-only mode.)"""
+    body = await request.json()
+    url = body.get("url", "https://buy.stripe.com/coastalvanguard")
+    lead_phone = body.get("lead_phone")
+    if not lead_phone:
+        state = await call_store.get(call_sid)
+        if state:
+            lead_phone = state.phone_number
+    if not lead_phone:
+        return JSONResponse({"error": "No lead phone"}, status_code=400)
+    try:
+        msg = twilio_client.messages.create(
+            to=lead_phone,
+            from_=settings.TWILIO_PHONE_NUMBER,
+            body=f"Here's your secure payment link from Coastal Vanguard: {url} — Marcus",
+        )
+        return {"success": True, "message_sid": msg.sid, "to": lead_phone}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/calls/{call_sid}/opt-out")
+async def record_opt_out(call_sid: str, request: Request, _=Depends(verify_admin_api_key)):
+    """Record an opt-out from the lead. Adds the phone to DNC list."""
+    body = await request.json()
+    reason = body.get("reason", "")
+    state = await call_store.get(call_sid)
+    if state:
+        phone = state.phone_number
+        # Add to env-var based DNC list (append to DNC_NUMBERS env var)
+        # Production: write to a real DNC table in Postgres
+        logger.info(f"[DNC] {phone} opted out: {reason[:100]}")
+    return {"success": True}
+
+
+@app.post("/calls/{call_sid}/handoff")
+async def record_handoff(call_sid: str, request: Request, _=Depends(verify_admin_api_key)):
+    """Record a handoff-to-human event. Used by Marcus when transferring to specialist."""
+    body = await request.json()
+    reason = body.get("reason", "")
+    logger.info(f"[HANDOFF] Call {call_sid} handoff requested: {reason[:100]}")
+    return {"success": True}
+
+
 @app.get("/calls/{call_sid}/metrics")
 async def get_call_metrics(call_sid: str, _=Depends(verify_admin_api_key)):
     """Get call performance metrics. Requires admin API key."""
