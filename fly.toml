@@ -15,6 +15,10 @@ primary_region = "iad"
 # community-confirmed working config for WebSocket on Fly uses
 # explicit port handlers. [http_service] does NOT support WebSocket
 # upgrades — it always returns 502 with "protocol error" on upgrade.
+#
+# Per Fly community: WebSocket over shared IPv4 only works on port
+# 443 with handlers = ["tls", "http"]. Port 80 (HTTP-only) does NOT
+# support WebSocket upgrades. So we expose ONLY port 443.
 
 [[services]]
   protocol = "tcp"
@@ -23,11 +27,6 @@ primary_region = "iad"
   auto_start_machines = true
   min_machines_running = 1
   processes = ["app"]
-
-  [[services.ports]]
-    port = 80
-    handlers = ["http"]
-    force_https = true
 
   [[services.ports]]
     port = 443
