@@ -147,8 +147,14 @@ WHAT YOU KNOW (full product catalog):
 
 {PRODUCT_KNOWLEDGE}
 
-GREETING (use the customer's name if they gave it):
-"Hi, this is Rachel from Coastal Vanguard. How can I help you today?"
+WHEN TO DIRECT CUSTOMER TO THE WEBSITE:
+- For deep product specifications, lab testing details, or scientific references
+- For browsing the full catalog visually (they want to see all SKUs at once)
+- For multi-page product info (CoA documents, batch numbers, etc.)
+- For bulk/wholesale inquiries or institutional accounts
+- For account management (login, order history, shipping address changes)
+- Always say it naturally: "For the full details, our website coastalvanguard.org has everything organized by category" or "You can see all the bundle options at coastalvanguard.org"
+- Never use the website as a cop-out. Try to answer the question first, then add the website as a "for more" pointer.
 """
 
 
@@ -175,8 +181,14 @@ WHAT YOU KNOW:
 
 {PRODUCT_KNOWLEDGE}
 
-GREETING:
-"Thank you for calling Coastal Vanguard. This is Marcus. How may I assist you today?"
+WHEN TO DIRECT CUSTOMER TO THE WEBSITE:
+- For deep product specifications, lab testing details, or scientific references
+- For browsing the full catalog visually (they want to see all SKUs at once)
+- For multi-page product info (CoA documents, batch numbers, etc.)
+- For bulk/wholesale inquiries or institutional accounts
+- For account management (login, order history, shipping address changes)
+- Always say it naturally: "For the full details, our website coastalvanguard.org has everything organized by category" or "You can see all the bundle options at coastalvanguard.org"
+- Never use the website as a cop-out. Try to answer the question first, then add the website as a "for more" pointer.
 """
 
 
@@ -243,8 +255,14 @@ HANDOFF PROTOCOL:
 OPT-OUT DETECTION (any of these trigger end-of-call):
 - "remove", "stop calling", "do not call", "don't call", "unsubscribe", "not interested"
 
-GREETING (use the lead's name if available):
-"Hi, this is Marcus calling from Coastal Vanguard. {lead_name}? I'm reaching out because you expressed interest in our peptide catalog. Do you have a quick minute?"
+WHEN TO DIRECT LEAD TO THE WEBSITE:
+- For deep product specifications, lab testing details, or scientific references
+- For browsing the full catalog visually (they want to see all SKUs at once)
+- For the "Complete Solution Packages" PDF brochure (it has detailed protocols and bundle breakdowns)
+- For bulk/wholesale inquiries or institutional accounts
+- For account management (login, order history, shipping address changes)
+- Always say it naturally: "For the full details, our website coastalvanguard.org has everything organized by category" or "You can see all the bundle options at coastalvanguard.org"
+- Never use the website as a cop-out. Try to answer the question first, then add the website as a "for more" pointer.
 """
 
 
@@ -484,7 +502,17 @@ async def handle_conversation_stream(websocket: WebSocket, persona: str = "suppo
                 if opt_out or handoff_requested:
                     continue
                 voice_prompt = data.get("voicePrompt", "").strip()
-                if not voice_prompt:
+                # Ignore empty prompts (these are triggered by Twilio edge events, not real user speech)
+                if not voice_prompt or len(voice_prompt) < 2:
+                    logger.debug(f"Empty/short prompt ignored: '{voice_prompt}'")
+                    continue
+                # Ignore the literal "Hello" / "Hi" starter if the first user input is a brief acknowledgment
+                # and we JUST sent a welcome — this prevents the LLM from "responding" to the welcome
+                if voice_prompt.lower() in ("hello", "hi", "hey", "yes", "yeah", "ok", "okay") and len(history) <= 1:
+                    # Send a gentle prompt to actually engage
+                    if persona == "sales":
+                        await send_text("Great. So tell me, what got you interested in peptides?", last=True)
+                        history.append({"role": "assistant", "content": "Great. So tell me, what got you interested in peptides?"})
                     continue
                 last = data.get("last", False)
                 logger.info(f"Prompt ({persona}): {voice_prompt[:80]}")
