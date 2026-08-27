@@ -149,7 +149,7 @@ async def incoming_support_conversation_webhook(
         ttsProvider="ElevenLabs",
         voice="TxGEqnHWrfWFTfGW9XjX",  # Josh
         transcriptionProvider="Deepgram",
-        speechModel="nova-3-general",
+        speechModel="nova-2-general",
         interruptible="any",
         interruptSensitivity="medium",
         welcomeGreeting="Thank you for calling Coastal Vanguard. This is Marcus. How may I assist you today?",
@@ -177,7 +177,7 @@ async def outbound_conversation_webhook(
         ttsProvider="ElevenLabs",
         voice="TxGEqnHWrfWFTfGW9XjX",  # Josh
         transcriptionProvider="Deepgram",
-        speechModel="nova-3-general",
+        speechModel="nova-2-general",
         interruptible="any",
         interruptSensitivity="medium",
     )
