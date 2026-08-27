@@ -300,6 +300,24 @@ async def media_stream(websocket: WebSocket):
 # Utilities & Monitoring
 # ═══════════════════════════════════════════════════════════════
 
+@app.get("/_version")
+async def version():
+    """Debug: which code is actually running."""
+    import hashlib, os
+    try:
+        with open(__file__, 'rb') as f:
+            h = hashlib.sha256(f.read()).hexdigest()[:12]
+    except:
+        h = "unknown"
+    return {
+        "git_sha": os.getenv("GIT_SHA", "unset"),
+        "code_hash": h,
+        "ws_url": os.getenv("WS_GATEWAY_URL", "wss://ws.coastalvanguard.org/ws"),
+        "base_url": settings.BASE_URL,
+        "has_ws_route": hasattr(app, "router") and any(getattr(r, "path", "") == "/ws/media-stream" for r in app.router.routes),
+    }
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health():
     """Deep health check with dependency validation.
