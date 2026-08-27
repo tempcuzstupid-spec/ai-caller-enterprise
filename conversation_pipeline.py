@@ -269,8 +269,6 @@ NEVER DO:
 
 
 PERSONAS = {
-
-PERSONAS = {
     "support": {
         "system_prompt": build_support_prompt(),
         "model": "gpt-4o-mini",
