@@ -167,11 +167,31 @@ async def outbound_conversation_webhook(
     form = await request.form()
     call_sid = form.get("CallSid")
     await call_store.update(call_sid, status="answered")
-    logger.info(f"[Webhook] Outbound conversation answered | sid={call_sid}")
+
+    # Fetch lead info from call_store so the WebSocket pipeline can use
+    # lead_name and lead_context in the system prompt and opening line
+    call_state = await call_store.get(call_sid)
+    lead_name = ""
+    lead_context = ""
+    if call_state:
+        lead_name = getattr(call_state, "lead_name", "") or ""
+        # The 'context' field in CallState holds what was sent as `context`
+        # or `lead_context` in the /call request body
+        lead_context = getattr(call_state, "context", "") or ""
+
+    logger.info(f"[Webhook] Outbound conversation answered | sid={call_sid} lead={lead_name!r} ctx={lead_context!r}")
 
     response = VoiceResponse()
     connect = Connect()
     ws_url = "wss://ws.coastalvanguard.org/ws/conversation?persona=sales"
+    # Twilio's ConversationRelay `parameters` are passed as `customParameters`
+    # in the WebSocket setup event. We pass lead_name and lead_context so
+    # the backend can personalize the greeting and system prompt.
+    params = {}
+    if lead_name:
+        params["lead_name"] = lead_name
+    if lead_context:
+        params["lead_context"] = lead_context
     connect.conversation_relay(
         url=ws_url,
         ttsProvider="ElevenLabs",
@@ -180,6 +200,7 @@ async def outbound_conversation_webhook(
         speechModel="nova-2-general",
         interruptible="any",
         interruptSensitivity="medium",
+        **({"parameters": params} if params else {}),
     )
     response.append(connect)
     return Response(content=str(response), media_type="application/xml")
