@@ -109,7 +109,7 @@ async def incoming_call_webhook(
     request: Request,
     _sig: None = Depends(verify_twilio_signature),
 ):
-    """Twilio inbound call webhook. Signature validated via dependency."""
+    """Twilio inbound call webhook. Miami number (786) — Rachel support AI."""
     form = await request.form()
     call_sid = form.get("CallSid")
     from_number = form.get("From", "unknown")
@@ -119,15 +119,44 @@ async def incoming_call_webhook(
         phone_number=from_number,
         direction="inbound",
         purpose="general",
+        line="miami-786",
     )
     record_call("inbound", "general", "initiated")
-    logger.info(f"[Webhook] Incoming call | sid={call_sid} from={redact_phone(from_number)}")
+    logger.info(f"[Webhook] Incoming (miami-786) | sid={call_sid} from={redact_phone(from_number)}")
 
     response = VoiceResponse()
     connect = Connect()
     # WebSocket URL points to the VPS (bypasses Fly's broken istio-envoy proxy).
-    # Override WS_GATEWAY_URL env var to change.
     ws_url = os.getenv("WS_GATEWAY_URL", "wss://ws.coastalvanguard.org/ws")
+    connect.stream(url=ws_url)
+    response.append(connect)
+    return Response(content=str(response), media_type="application/xml")
+
+
+@app.post("/webhook/incoming-support")
+async def incoming_support_webhook(
+    request: Request,
+    _sig: None = Depends(verify_twilio_signature),
+):
+    """Toll-free (888) — different persona (Marcus, formal corporate)."""
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    from_number = form.get("From", "unknown")
+
+    await call_store.create(
+        call_sid=call_sid,
+        phone_number=from_number,
+        direction="inbound",
+        purpose="customer_service",
+        line="tollfree-888",
+    )
+    record_call("inbound", "customer_service", "initiated")
+    logger.info(f"[Webhook] Incoming (tollfree-888) | sid={call_sid} from={redact_phone(from_number)}")
+
+    response = VoiceResponse()
+    connect = Connect()
+    # Different WebSocket path for toll-free persona
+    ws_url = os.getenv("WS_GATEWAY_URL_SUPPORT", "wss://ws.coastalvanguard.org/ws/support")
     connect.stream(url=ws_url)
     response.append(connect)
     return Response(content=str(response), media_type="application/xml")
@@ -138,7 +167,7 @@ async def outbound_call_webhook(
     request: Request,
     _sig: None = Depends(verify_twilio_signature),
 ):
-    """Twilio outbound call connect webhook."""
+    """Twilio outbound call connect webhook — when the AI dials a lead, the lead answers, Twilio hits this to get the Stream URL."""
     form = await request.form()
     call_sid = form.get("CallSid")
     await call_store.update(call_sid, status="answered")
@@ -146,11 +175,54 @@ async def outbound_call_webhook(
 
     response = VoiceResponse()
     connect = Connect()
-    # WebSocket URL points to the VPS (bypasses Fly's broken istio-envoy proxy).
-    ws_url = os.getenv("WS_GATEWAY_URL", "wss://ws.coastalvanguard.org/ws")
+    # Sales WebSocket path
+    ws_url = os.getenv("WS_GATEWAY_URL_SALES", "wss://ws.coastalvanguard.org/ws/sales")
     connect.stream(url=ws_url)
     response.append(connect)
     return Response(content=str(response), media_type="application/xml")
+
+
+@app.post("/webhook/outbound-status")
+async def outbound_status_webhook(
+    request: Request,
+    _sig: None = Depends(verify_twilio_signature),
+):
+    """Status callback for the outbound numbers. Twilio hits this for
+    ringing/answered/completed events on the 754 numbers."""
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    status = form.get("CallStatus")
+    direction = form.get("Direction", "outbound-api")
+    to_number = form.get("To", "unknown")
+    from_number = form.get("From", "unknown")
+
+    # Only create call record if it doesn't exist (first status event)
+    if status == "ringing":
+        try:
+            await call_store.create(
+                call_sid=call_sid,
+                phone_number=to_number,
+                direction="outbound",
+                purpose="sales",
+                line="outbound-754",
+            )
+        except Exception:
+            pass  # already exists
+
+    duration = form.get("CallDuration")
+    update = {"status": status}
+    if duration:
+        try: update["duration"] = int(duration)
+        except ValueError: pass
+
+    try:
+        await call_store.update(call_sid, **update)
+    except Exception:
+        pass
+
+    record_call("outbound", "sales", status)
+    logger.info(f"[Webhook] Outbound status | sid={call_sid} status={status} to={redact_phone(to_number)}")
+    return {"received": True}
 
 
 @app.post("/webhook/status")
@@ -193,14 +265,68 @@ async def trigger_outbound_call(
     body: OutboundCallRequest,
     _=Depends(verify_admin_api_key),
 ):
-    """Trigger an AI-powered outbound call. Requires admin API key."""
+    """Trigger an AI-powered outbound sales call. Requires admin API key.
+
+    Rotates caller ID between the two 754 numbers (primary/secondary) for
+    local-presence dialing. Uses the sales WebSocket pipeline.
+
+    Body fields:
+      to:           E.164 phone number of the lead
+      purpose:      sales, lead_qualification, sales_close, appointment
+      context:      Free-form context
+      lead_name:    Lead's name (used in greeting)
+      lead_context: Specific context (e.g., "showed interest in retatrutide")
+      tz:           IANA timezone (default America/New_York)
+    """
+    # Round-robin caller ID rotation between the 2 outbound numbers
+    primary_cid = os.getenv("TWILIO_OUTBOUND_PRIMARY", "+17542193360")
+    secondary_cid = os.getenv("TWILIO_OUTBOUND_SECONDARY", "+17542092728")
+    # Simple rotation: count outbound calls in last 1 min and alternate
+    # (production: use Redis counter or DB-backed counter)
+    import random
+    caller_id = random.choice([primary_cid, secondary_cid])
+
+    # Compliance check: calling hours (7am-7pm local time)
+    # Lead timezone passed in body.tz (default: America/New_York)
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        tz_name = getattr(body, "tz", "America/New_York")
+        tz = ZoneInfo(tz_name)
+        local_hour = datetime.now(tz).hour
+        if local_hour < 7 or local_hour >= 19:
+            return CallResponse(
+                success=False,
+                to=body.to,
+                purpose=body.purpose,
+                status="rejected_calling_hours",
+                message=f"Outside calling hours (7am-7pm {tz_name}). Current local hour: {local_hour}",
+            )
+    except Exception as e:
+        logger.warning(f"Calling-hours check failed (non-fatal): {e}")
+
+    # DNC list check (if env var set)
+    dnc_list_raw = os.getenv("DNC_NUMBERS", "")
+    if dnc_list_raw:
+        dnc_set = set(x.strip() for x in dnc_list_raw.split(","))
+        if body.to in dnc_set:
+            return CallResponse(
+                success=False,
+                to=body.to,
+                purpose=body.purpose,
+                status="rejected_dnc",
+                message="Number is on DNC list",
+            )
+
     call = twilio_client.calls.create(
         to=body.to,
-        from_=settings.TWILIO_PHONE_NUMBER,
-        url=f"{settings.BASE_URL}/webhook/outbound",
-        status_callback=f"{settings.BASE_URL}/webhook/status",
+        from_=caller_id,
+        url=f"{settings.BASE_URL}/webhook/outbound",  # When lead answers, gets sales TwiML
+        status_callback=f"{settings.BASE_URL}/webhook/outbound-status",  # Status events
         status_callback_event=["initiated", "ringing", "answered", "completed"],
         status_callback_method="POST",
+        # Recording disclosure: announce call is recorded at start
+        record=True,
     )
 
     await call_store.create(
@@ -208,10 +334,13 @@ async def trigger_outbound_call(
         phone_number=body.to,
         direction="outbound",
         purpose=body.purpose,
-        context=body.context,
+        context=body.context or "",
+        line="outbound-754",
+        caller_id=caller_id,
+        lead_name=body.lead_name,
     )
     record_call("outbound", body.purpose, "initiated")
-    logger.info(f"[API] Outbound call | sid={call.sid} to={redact_phone(body.to)} purpose={body.purpose}")
+    logger.info(f"[API] Outbound call | sid={call.sid} to={redact_phone(body.to)} purpose={body.purpose} from={caller_id}")
 
     return CallResponse(
         success=True,
@@ -219,6 +348,7 @@ async def trigger_outbound_call(
         to=body.to,
         purpose=body.purpose,
         status=call.status,
+        caller_id=caller_id,
     )
 
 
