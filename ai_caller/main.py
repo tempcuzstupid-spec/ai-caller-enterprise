@@ -154,6 +154,8 @@ async def incoming_support_conversation_webhook(
         interruptSensitivity="medium",
         welcomeGreeting="Thank you for calling Coastal Vanguard. This is Marcus. How may I assist you today?",
     )
+    # When ConversationRelay ends (handoff or normal), Twilio POSTs here.
+    connect.action(f"{settings.BASE_URL}/webhook/transfer")
     response.append(connect)
     return Response(content=str(response), media_type="application/xml")
 
@@ -202,8 +204,140 @@ async def outbound_conversation_webhook(
         interruptSensitivity="medium",
         **({"parameters": params} if params else {}),
     )
+    # When ConversationRelay ends (either normally OR via the "end" message
+    # with handoffData), Twilio POSTs to this action URL. The /webhook/transfer
+    # handler reads HandoffData and decides whether to <Dial> David.
+    connect.action(f"{settings.BASE_URL}/webhook/transfer")
     response.append(connect)
     return Response(content=str(response), media_type="application/xml")
+
+
+@app.post("/webhook/transfer")
+async def transfer_webhook(
+    request: Request,
+    _sig: None = Depends(verify_twilio_signature),
+):
+    """Called by Twilio when ConversationRelay ends. If handoffData.reasonCode
+    is "live-agent-handoff", this returns TwiML that <Dial>s the human rep
+    (David) so the lead talks to a real person. Otherwise the call ends.
+
+    The handoff data is passed via the WebSocket "end" message in
+    conversation_pipeline.py when the lead asks for a human / wants to order.
+    """
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    handoff_data_raw = form.get("HandoffData", "")
+    handoff_data = {}
+    if handoff_data_raw:
+        try:
+            handoff_data = json.loads(handoff_data_raw)
+        except Exception as e:
+            logger.warning(f"[Transfer] Bad HandoffData JSON: {e}")
+
+    reason_code = handoff_data.get("reasonCode", "")
+    lead_name = handoff_data.get("lead_name", "the caller")
+    persona = handoff_data.get("persona", "support")
+    reason = handoff_data.get("reason", "the caller requested a human")
+
+    logger.info(f"[Transfer] call={call_sid} reasonCode={reason_code!r} persona={persona} lead={lead_name!r}")
+
+    response = VoiceResponse()
+
+    if reason_code != "live-agent-handoff":
+        # Normal end of call (caller hung up, conversation finished, etc).
+        # Just say goodbye and end.
+        response.say("Thanks for calling Coastal Vanguard. Have a great day.")
+        return Response(content=str(response), media_type="application/xml")
+
+    # Live-agent handoff: dial the human rep.
+    # We whisper context to David before bridging: who the lead is, what
+    # they wanted, and which persona was active. David hears this, the
+    # caller does not.
+    whisper = (
+        f"Live handoff. Lead: {lead_name}. "
+        f"Persona: {persona}. "
+        f"Reason: {reason[:120]}. "
+        f"When the caller hears the beep, greet them and confirm their order."
+    )
+    dial = response.dial(
+        caller_id=settings.TWILIO_PHONE_NUMBER,  # Our Twilio number shows on caller ID
+        answer_on_bridge=True,  # Bridge only when David picks up
+        timeout=30,  # Ring David for 30s
+    )
+    # The <Number> noun dials an external number. We use it because David's
+    # number (+17543529826) is a personal cell, not a Twilio client.
+    dial.number(
+        settings.HUMAN_REP_NUMBER,
+        send_digits="wwww1928",  # Optional: bypass David's voicemail
+    )
+
+    # If the dial fails (David doesn't answer), say a goodbye and offer
+    # to text instead.
+    if dial.payload:
+        # action URL on the dial — if David doesn't pick up, Twilio hits this
+        # and we can fall back to an SMS or voicemail.
+        pass
+
+    # Fallback if <Dial> doesn't complete (David didn't answer)
+    response.say(
+        f"Sorry, our specialist didn't pick up. I'll text you a direct line "
+        f"so you can reach us. Sorry about that!",
+        voice="Polly.Joanna",
+    )
+
+    return Response(content=str(response), media_type="application/xml")
+
+
+@app.post("/webhook/incoming-sms")
+async def incoming_sms_webhook(
+    request: Request,
+    _sig: None = Depends(verify_twilio_signature),
+):
+    """When a lead texts our Twilio number back (e.g. "what packages
+    do you have?"), we acknowledge and offer to call them or send the
+    catalog link. This is the "SMS handoff" path.
+
+    For now: simple keyword-ack reply. A future iteration can call the
+    LLM to generate a real conversational SMS reply.
+    """
+    form = await request.form()
+    from_number = form.get("From", "")
+    body = (form.get("Body", "") or "").strip().lower()
+
+    logger.info(f"[SMS-In] from={redact_phone(from_number)} body={body[:120]!r}")
+
+    # DNC: if they text "stop", "unsubscribe", "quit", or "cancel"
+    if any(kw in body for kw in ("stop", "unsubscribe", "quit", "cancel", "remove", "opt out", "do not call")):
+        twilio_client.messages.create(
+            to=from_number,
+            from_=settings.TWILIO_PHONE_NUMBER,
+            body="You've been removed from our list. Sorry for the bother. — Marcus, Coastal Vanguard",
+        )
+        logger.info(f"[SMS-In] DNC opt-out for {redact_phone(from_number)}")
+        return Response(content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>', media_type="application/xml")
+
+    # Catalog request: "catalog", "menu", "info", "details", "what do you have"
+    if any(kw in body for kw in ("catalog", "menu", "info", "details", "what do you have", "packages", "products", "send it", "send me", "yes", "link")):
+        twilio_client.messages.create(
+            to=from_number,
+            from_=settings.TWILIO_PHONE_NUMBER,
+            body=f"Here's the full Coastal Vanguard catalog: https://coastalvanguard.org — Marcus. Call or text me back anytime.",
+        )
+        logger.info(f"[SMS-In] Sent catalog link to {redact_phone(from_number)}")
+        return Response(content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>', media_type="application/xml")
+
+    # Default: acknowledge and offer the next step
+    twilio_client.messages.create(
+        to=from_number,
+        from_=settings.TWILIO_PHONE_NUMBER,
+        body=(
+            f"Hey! Marcus from Coastal Vanguard here — got your text. "
+            f"Want me to send the catalog? Text CATALOG. "
+            f"Or call me back at this number. — Marcus"
+        ),
+    )
+    logger.info(f"[SMS-In] Sent default ack to {redact_phone(from_number)}")
+    return Response(content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>', media_type="application/xml")
 
 
 @app.post("/webhook/outbound-status")
@@ -246,6 +380,40 @@ async def outbound_status_webhook(
 
     record_call("outbound", "sales", status)
     logger.info(f"[Webhook] Outbound status | sid={call_sid} status={status} to={redact_phone(to_number)}")
+
+    # ── Missed-call auto-text: when the lead doesn't pick up, send a follow-up SMS ──
+    if status in ("no-answer", "busy", "failed"):
+        try:
+            call_state = await call_store.get(call_sid)
+            lead_name = getattr(call_state, "lead_name", "") if call_state else ""
+            first_name = lead_name.split()[0] if lead_name else "there"
+            sms_body = (
+                f"Hey {first_name} — this is Marcus from Coastal Vanguard. "
+                f"Just tried to give you a ring about our wellness programs. "
+                f"When you get a sec, call me back at {from_number} or text this number. "
+                f"Talk soon! — Marcus"
+            )
+            msg = twilio_client.messages.create(
+                to=to_number,
+                from_=settings.TWILIO_PHONE_NUMBER,
+                body=sms_body,
+            )
+            logger.info(f"[Missed-call SMS] Sent to {redact_phone(to_number)} sid={msg.sid}")
+        except Exception as e:
+            logger.warning(f"[Missed-call SMS] Failed for {call_sid}: {e}")
+
+    # ── Voicemail detection: if completed but very short duration, the call likely went to voicemail ──
+    # We don't get the voicemail audio here — Twilio's voicemail transcription requires
+    # a separate voicemail TwiML. For now we just log the case.
+    if status == "completed":
+        try:
+            dur = int(duration) if duration else 0
+            if dur > 0 and dur < 8:
+                logger.info(f"[Voicemail?] Call {call_sid} to {redact_phone(to_number)} completed in {dur}s — likely voicemail")
+                # TODO: trigger a voicemail drop (pre-recorded audio)
+        except Exception:
+            pass
+
     return {"received": True}
 
 
@@ -546,28 +714,63 @@ async def get_transcript(call_sid: str, _=Depends(verify_admin_api_key)):
 @app.post("/calls/{call_sid}/send-catalog-sms")
 async def send_catalog_sms(call_sid: str, request: Request, _=Depends(verify_admin_api_key)):
     """Send a catalog link SMS to the lead's phone. Triggered by Marcus
-    when he says he's sending the link."""
+    when he says he's sending the link.
+
+    Optional body fields:
+      - package: package name (e.g. "A1 · First Time, Done Right")
+      - lead_name: personalization (e.g. "David")
+      - url: link to send (defaults to coastalvanguard.org)
+    """
     body = await request.json()
     url = body.get("url", "https://coastalvanguard.org")
+    package = body.get("package", "").strip()
     lead_phone = body.get("lead_phone")
 
-    # If lead_phone not passed, get from call record
-    if not lead_phone:
-        state = await call_store.get(call_sid)
-        if state:
-            lead_phone = state.phone_number
-
+    # Resolve lead info from call store
+    state = await call_store.get(call_sid)
+    if not lead_phone and state:
+        lead_phone = state.phone_number
     if not lead_phone:
         return JSONResponse({"error": "No lead phone number available"}, status_code=400)
+
+    lead_name = body.get("lead_name", "").strip()
+    if not lead_name and state:
+        lead_name = getattr(state, "lead_name", "") or ""
+    first_name = lead_name.split()[0] if lead_name else ""
+
+    # Personalize the message based on whether Marcus recommended a package
+    if package and first_name:
+        sms_body = (
+            f"Hey {first_name} — Marcus from Coastal Vanguard here. "
+            f"Like we discussed, here's more on the {package}: {url} "
+            f"Take your time — text me back anytime on this number. — Marcus"
+        )
+    elif package:
+        sms_body = (
+            f"Hey — Marcus from Coastal Vanguard. "
+            f"Like we discussed, here's more on the {package}: {url} "
+            f"Text back anytime on this number. — Marcus"
+        )
+    elif first_name:
+        sms_body = (
+            f"Hey {first_name} — Marcus from Coastal Vanguard here. "
+            f"Here's our full catalog as promised: {url} "
+            f"Text me back anytime on this number. — Marcus"
+        )
+    else:
+        sms_body = (
+            f"Thanks for your interest in Coastal Vanguard! "
+            f"Here's the full catalog: {url} — Marcus"
+        )
 
     try:
         msg = twilio_client.messages.create(
             to=lead_phone,
             from_=settings.TWILIO_PHONE_NUMBER,
-            body=f"Thanks for your interest in Coastal Vanguard! Here's the full catalog: {url} — Marcus",
+            body=sms_body,
         )
-        logger.info(f"[SMS] Catalog link sent to {lead_phone} via {msg.sid}")
-        return {"success": True, "message_sid": msg.sid, "to": lead_phone}
+        logger.info(f"[SMS] Catalog link sent to {redact_phone(lead_phone)} sid={msg.sid} package={package!r} lead_name={first_name!r}")
+        return {"success": True, "message_sid": msg.sid, "to": lead_phone, "body": sms_body}
     except Exception as e:
         logger.error(f"[SMS] Failed to send: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)

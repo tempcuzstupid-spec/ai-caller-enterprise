@@ -289,9 +289,15 @@ async def handle_conversation_stream(websocket: WebSocket, persona: str = "suppo
         except Exception as e:
             logger.warning(f"send_text: {e}")
 
-    async def send_end():
+    async def send_end(handoff_data: dict = None):
+        """End the ConversationRelay session. If handoff_data is provided,
+        Twilio will POST it to the action URL on the <Connect> verb. That
+        action handler can then <Dial> a human agent."""
+        msg = {"type": "end"}
+        if handoff_data:
+            msg["handoffData"] = json.dumps(handoff_data)
         try:
-            await websocket.send_text(json.dumps({"type": "end"}))
+            await websocket.send_text(json.dumps(msg))
         except Exception:
             pass
 
@@ -340,18 +346,39 @@ async def handle_conversation_stream(websocket: WebSocket, persona: str = "suppo
                 except Exception as e:
                     logger.warning(f"send-payment-link: {e}")
 
-        # Send catalog link via SMS when Marcus says he's sending it
-        if not catalog_sms_sent and ("text you" in full.lower() or "send you the link" in full.lower() or "sending it" in full.lower()):
+        # Send catalog link via SMS when Marcus says he's sending it.
+        # Try to extract the package Marcus recommended (if any) so the SMS
+        # is personalized — "Like we discussed, here's more on A1..."
+        if not catalog_sms_sent and ("text you" in full.lower() or "send you the link" in full.lower() or "sending it" in full.lower() or "text that" in full.lower()):
             if call_sid and FLY_ADMIN_KEY:
+                # Try to pull the recommended package out of the LLM output
+                recommended = ""
+                for pkg_name in [
+                    "A1", "A2", "A3", "A4", "A5",
+                    "B1", "B2", "B3",
+                    "C1", "C2",
+                    "D1", "D2",
+                    "E1", "E2",
+                    "F1", "G1",
+                    "H1", "H2", "H3", "H4", "H5",
+                ]:
+                    if pkg_name in full:
+                        recommended = pkg_name
+                        break
                 try:
                     async with httpx.AsyncClient(timeout=10.0) as client:
                         await client.post(
                             f"{FLY_API_URL}/calls/{call_sid}/send-catalog-sms",
                             headers={"X-API-Key": FLY_ADMIN_KEY},
-                            json={"url": "https://coastalvanguard.org", "lead_phone": lead_phone},
+                            json={
+                                "url": "https://coastalvanguard.org",
+                                "lead_phone": lead_phone,
+                                "package": recommended,
+                                "lead_name": lead_name,
+                            },
                         )
                     catalog_sms_sent = True
-                    logger.info(f"Catalog SMS sent for {call_sid}")
+                    logger.info(f"Catalog SMS sent for {call_sid} package={recommended!r}")
                 except Exception as e:
                     logger.warning(f"send-catalog-sms: {e}")
 
@@ -426,7 +453,7 @@ async def handle_conversation_stream(websocket: WebSocket, persona: str = "suppo
                     handoff_requested = True
                     logger.info(f"HANDOFF: {voice_prompt[:80]}")
                     if persona == "sales":
-                        await send_text("Of course, let me connect you with my colleague who can help finalize this. One moment please.", last=True)
+                        await send_text("Of course, let me grab my colleague David for you — he can take it from here. One moment please.", last=True)
                     else:
                         await send_text("Of course, let me connect you with a specialist who can help. One moment please.", last=True)
                     if call_sid and FLY_ADMIN_KEY:
@@ -435,7 +462,19 @@ async def handle_conversation_stream(websocket: WebSocket, persona: str = "suppo
                                 await client.post(f"{FLY_API_URL}/calls/{call_sid}/handoff", headers={"X-API-Key": FLY_ADMIN_KEY}, json={"reason": voice_prompt[:200]})
                         except Exception as e:
                             logger.warning(f"handoff record: {e}")
-                    await send_end()
+                    # Build handoffData with caller context. The Fly action
+                    # handler at /webhook/transfer will receive this and <Dial>
+                    # the human rep (David). It also gets a "whisper" so David
+                    # knows who he's about to talk to.
+                    handoff_data = {
+                        "reasonCode": "live-agent-handoff",
+                        "reason": voice_prompt[:200],
+                        "lead_name": lead_name or "the caller",
+                        "lead_phone": lead_phone or "",
+                        "persona": persona,
+                        "caller_id": HUMAN_REP_NUMBER,  # The number to dial (set in Fly handler)
+                    }
+                    await send_end(handoff_data=handoff_data)
                     continue
 
                 # Cancel in-flight LLM if user is interrupting
