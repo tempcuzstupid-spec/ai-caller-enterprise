@@ -263,57 +263,10 @@ def trim_history(history: list, max_turns: int) -> list:
     return history
 
 
-async def fetch_agent_config(agent_id: int) -> dict | None:
-    """Fetch agent config from the Fly app's /agents/{id} endpoint.
-    Cached in-process for 60s to avoid hammering Fly on every WebSocket connection.
-    Returns the agent dict, or None on failure.
-    """
-    if not FLY_API_URL or not FLY_ADMIN_KEY:
-        return None
-    import time as _time
-    cache_key = f"agent:{agent_id}"
-    now = _time.monotonic()
-    if cache_key in _AGENT_CACHE:
-        cached_at, cached_value = _AGENT_CACHE[cache_key]
-        if (now - cached_at) < 60:
-            return cached_value
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(
-                f"{FLY_API_URL}/agents/{agent_id}",
-                headers={"X-API-Key": FLY_ADMIN_KEY},
-            )
-            if r.status_code == 200:
-                agent = r.json()
-                _AGENT_CACHE[cache_key] = (now, agent)
-                return agent
-            logger.warning(f"[WS] Fly /agents/{agent_id} returned {r.status_code}")
-            return None
-    except Exception as e:
-        logger.warning(f"[WS] Failed to fetch agent {agent_id} from Fly: {e}")
-        return None
-
-
-_AGENT_CACHE: dict = {}
-
-
-async def handle_conversation_stream(websocket: WebSocket, persona: str = "support", agent_id: int | None = None):
+async def handle_conversation_stream(websocket: WebSocket, persona: str = "support"):
     await websocket.accept()
-
-    # If an agent_id is provided, fetch the agent's config from Fly.
-    # This overrides the persona-derived prompt/opening line/voice/model.
-    agent_config: dict | None = None
-    if agent_id:
-        agent_config = await fetch_agent_config(agent_id)
-        if agent_config:
-            logger.info(f"WS accepted | agent_id={agent_id} slug={agent_config.get('slug')!r}")
-        else:
-            logger.warning(f"WS accepted | agent_id={agent_id} (NOT FOUND on Fly, falling back to persona={persona!r})")
-
-    # Resolve the persona config (fallback path)
     persona_cfg = PERSONAS.get(persona, PERSONAS["support"])
-    if not agent_config:
-        logger.info(f"WS accepted | persona={persona}")
+    logger.info(f"WS accepted | persona={persona}")
 
     call_sid = None
     stream_sid = None
@@ -442,37 +395,31 @@ async def handle_conversation_stream(websocket: WebSocket, persona: str = "suppo
                 custom = data.get("customParameters", {}) or {}
                 lead_name = custom.get("lead_name", "")
                 lead_context = custom.get("lead_context", "")
-                logger.info(
-                    f"Setup: call={call_sid} lead={lead_name} from={lead_phone} "
-                    f"persona={persona} agent_id={agent_id}"
-                )
+                logger.info(f"Setup: call={call_sid} lead={lead_name} from={lead_phone} persona={persona}")
 
-                # Resolve the system prompt and opening line.
-                # If we have agent_config from Fly, use it. Otherwise fall
-                # back to the legacy persona path.
+                # Build persona-specific system prompt.
+                # For sales: prompt_builder returns (system, opening_line).
+                # For others: it returns a string system prompt.
                 sales_opening_line = None
-                if agent_config:
-                    system_prompt = agent_config.get("system_prompt") or persona_cfg["system_prompt"]
-                    # If the agent has an opening_line, use it. Otherwise let
-                    # the LLM greet from the system prompt.
-                    agent_opening = agent_config.get("opening_line") or ""
-                    if agent_opening:
-                        # Substitute {name} if present
-                        agent_name = agent_config.get("name", "")
-                        sales_opening_line = agent_opening.replace("{name}", agent_name)
-                elif persona == "sales":
+                if persona == "sales":
                     system_prompt, sales_opening_line = build_sales_prompt(lead_name, lead_context)
                 else:
                     system_prompt = persona_cfg["system_prompt"]
 
-                # If the agent is outbound-direction, send the opening line.
-                # If inbound, stay silent and wait for the caller to speak.
-                is_outbound = (agent_config and agent_config.get("direction") == "outbound") or (not agent_config and persona == "sales")
+                # For inbound (tollfree, support): the CALLER spoke first by
+                # dialing the number. The caller has not said anything yet —
+                # the LLM should NOT speak until the first prompt event.
+                # For outbound (sales): the AI should greet first. We send
+                # the prepared opening_line as audio, and the LLM will treat
+                # the caller's reply as the next turn.
 
-                if is_outbound and sales_opening_line:
+                if persona == "sales" and sales_opening_line:
+                    # Outbound: AI greets first
                     await send_text(sales_opening_line, last=True)
+                    # Record the opener in history so the LLM has continuity
                     history.append({"role": "assistant", "content": sales_opening_line})
                 # Inbound: stay silent, wait for the caller's first prompt
+                # (this prevents the role-reversal bug from before)
 
             elif msg_type == "prompt":
                 if opt_out or handoff_requested:
@@ -525,8 +472,6 @@ async def handle_conversation_stream(websocket: WebSocket, persona: str = "suppo
                         "lead_name": lead_name or "the caller",
                         "lead_phone": lead_phone or "",
                         "persona": persona,
-                        "agent_id": agent_id,
-                        "agent_slug": (agent_config or {}).get("slug"),
                         "caller_id": HUMAN_REP_NUMBER,  # The number to dial (set in Fly handler)
                     }
                     await send_end(handoff_data=handoff_data)
@@ -542,16 +487,12 @@ async def handle_conversation_stream(websocket: WebSocket, persona: str = "suppo
                         pass
 
                 # Build persona prompt (rebuild in case lead info changed)
-                if agent_config:
-                    system_prompt = agent_config.get("system_prompt") or persona_cfg["system_prompt"]
-                    model = agent_config.get("model") or persona_cfg["model"]
-                elif persona == "sales":
+                if persona == "sales":
                     system_prompt, _ = build_sales_prompt(lead_name, lead_context)
-                    model = persona_cfg["model"]
                 else:
                     system_prompt = persona_cfg["system_prompt"]
-                    model = persona_cfg["model"]
 
+                model = persona_cfg["model"]
                 current_llm_task = asyncio.create_task(generate_and_send(voice_prompt, system_prompt, model))
 
             elif msg_type == "interrupt":
@@ -626,14 +567,5 @@ async def health():
 
 @app.websocket("/ws/conversation")
 async def ws_conversation_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for Twilio ConversationRelay.
-
-    Query params:
-      agent_id: ID of the agent to use (preferred). If absent, falls back
-                to the legacy `persona` param.
-      persona:  Legacy param — one of support/tollfree/sales. Only used
-                if agent_id is absent. Backwards-compatible.
-    """
-    agent_id_str = websocket.query_params.get("agent_id")
     persona = websocket.query_params.get("persona", "support")
-    await handle_conversation_stream(websocket, persona=persona, agent_id=int(agent_id_str) if agent_id_str else None)
+    await handle_conversation_stream(websocket, persona)

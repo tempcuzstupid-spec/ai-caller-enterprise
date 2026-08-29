@@ -66,42 +66,6 @@ CREATE TABLE IF NOT EXISTS call_metrics (
 );
 
 CREATE INDEX IF NOT EXISTS idx_metrics_call ON call_metrics(call_sid);
-
--- ── Agents (per-persona config) ─────────────────────────────────────────
--- An agent is a complete voice AI persona: system prompt, opening line,
--- voice ID, model, handoff number, and which Twilio number to call from.
--- Phase 1 is single-tenant (no user_id yet) — all agents belong to the
--- owner. Phase 2 will add user_id + per-tenant credentials.
-CREATE TABLE IF NOT EXISTS agents (
-    id                  SERIAL PRIMARY KEY,
-    name                VARCHAR(120) NOT NULL,
-    slug                VARCHAR(64) UNIQUE NOT NULL,
-    category            VARCHAR(32) NOT NULL CHECK (category IN (
-                            'inbound_support', 'outbound_sales',
-                            'appointment_reminder', 'personal_assistant', 'custom'
-                        )),
-    direction           VARCHAR(16) NOT NULL CHECK (direction IN ('inbound', 'outbound', 'both')),
-    system_prompt       TEXT NOT NULL,
-    opening_line        TEXT,
-    voice_id            VARCHAR(64) NOT NULL DEFAULT 'TxGEqnHWrfWFTfGW9XjX',
-    model               VARCHAR(64) NOT NULL DEFAULT 'gpt-4o-mini',
-    handoff_number      VARCHAR(32),
-    handoff_action_url  VARCHAR(512),
-    from_numbers        TEXT NOT NULL DEFAULT '',  -- CSV of E.164 numbers; first = primary
-    knowledge_base      TEXT,                       -- optional inline catalog/system info
-    active              BOOLEAN NOT NULL DEFAULT TRUE,
-    is_template         BOOLEAN NOT NULL DEFAULT FALSE,  -- templates can't be deleted
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_agents_slug ON agents(slug);
-CREATE INDEX IF NOT EXISTS idx_agents_active ON agents(active);
-CREATE INDEX IF NOT EXISTS idx_agents_category ON agents(category);
-
--- Link calls to the agent that handled them
-ALTER TABLE calls ADD COLUMN IF NOT EXISTS agent_id INTEGER REFERENCES agents(id) ON DELETE SET NULL;
-CREATE INDEX IF NOT EXISTS idx_calls_agent ON calls(agent_id);
 """
 
 
