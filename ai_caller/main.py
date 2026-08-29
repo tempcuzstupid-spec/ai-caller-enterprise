@@ -24,10 +24,10 @@ from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse, Connect
 
 from ai_caller.config import get_settings
-from ai_caller.database import init_pool, close_pool
+from ai_caller.database import init_pool, close_pool, get_conn
 from ai_caller.store import call_store
 from ai_caller.pipeline import CallPipeline
-from ai_caller.models import OutboundCallRequest, CallResponse, HealthResponse
+from ai_caller.models import OutboundCallRequest, CallResponse, HealthResponse, Agent, AgentCreate, AgentUpdate, AgentListResponse
 from ai_caller.security import verify_admin_api_key, redact_phone
 from ai_caller.middleware import logging_middleware, body_cache_middleware
 from ai_caller.security import verify_twilio_signature
@@ -60,6 +60,14 @@ async def lifespan(app: FastAPI):
     logger.info(f"🚀 AI Caller Enterprise starting | ENV={settings.ENV} | BASE_URL={settings.BASE_URL}")
     try:
         await init_pool()
+        # Seed agent templates on first boot
+        try:
+            from ai_caller.agent_store import seed_templates_if_empty
+            inserted = await seed_templates_if_empty()
+            if inserted:
+                logger.info(f"🌱 Seeded {inserted} agent templates")
+        except Exception as e:
+            logger.warning(f"Agent template seeding failed (non-fatal): {e}")
     except Exception as exc:
         logger.error(
             f"⚠️ Database init failed (continuing in degraded mode): {exc}",
@@ -98,6 +106,121 @@ app.add_middleware(
 # Prometheus metrics endpoint
 metrics_app = make_asgi_app()
 app.mount("/metrics", metrics_app)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Agent CRUD (Phase 1 — single-tenant, no auth)
+# ═══════════════════════════════════════════════════════════════
+
+from ai_caller.agent_store import agent_store, seed_templates_if_empty, AGENT_TEMPLATES
+
+
+@app.get("/agents", response_model=AgentListResponse)
+async def list_agents(_=Depends(verify_admin_api_key)):
+    """List all AI agents (personas). Templates are listed first."""
+    agents = await agent_store.list()
+    return AgentListResponse(total=len(agents), agents=[Agent(**a.to_dict()) for a in agents])
+
+
+@app.get("/agents/templates")
+async def list_agent_templates(_=Depends(verify_admin_api_key)):
+    """List the 5 built-in agent templates (metadata only — instantiate via POST /agents)."""
+    return {
+        "templates": [
+            {
+                "id": t["slug"],
+                "label": t["name"],
+                "description": AGENT_CATEGORIES[t["category"]]["description"],
+                "direction": t["direction"],
+                "category": t["category"],
+                "default_prompt": t["system_prompt"],
+                "default_opening": t["opening_line"],
+            }
+            for t in AGENT_TEMPLATES
+        ]
+    }
+
+
+AGENT_CATEGORIES = {
+    "inbound_support": {
+        "label": "Inbound Support",
+        "description": "Answers calls 24/7, resolves questions, transfers to a human on request.",
+        "direction": "inbound",
+    },
+    "outbound_sales": {
+        "label": "Outbound Sales",
+        "description": "Calls leads, qualifies interest, recommends, and warms up for a human closer.",
+        "direction": "outbound",
+    },
+    "appointment_reminder": {
+        "label": "Appointment Reminder",
+        "description": "Calls to confirm, reschedule, or remind about appointments.",
+        "direction": "outbound",
+    },
+    "personal_assistant": {
+        "label": "Personal Assistant",
+        "description": "Makes calls on your behalf — bookings, inquiries, reservations.",
+        "direction": "both",
+    },
+    "custom": {
+        "label": "Custom Agent",
+        "description": "Build your own from scratch.",
+        "direction": "both",
+    },
+}
+
+
+@app.get("/agents/{agent_id}", response_model=Agent)
+async def get_agent(agent_id: int, _=Depends(verify_admin_api_key)):
+    a = await agent_store.get(agent_id)
+    if not a:
+        return JSONResponse({"error": "Agent not found"}, status_code=404)
+    return Agent(**a.to_dict())
+
+
+@app.post("/agents", response_model=Agent, status_code=201)
+async def create_agent(body: AgentCreate, _=Depends(verify_admin_api_key)):
+    """Create a new agent persona. Slug must be unique."""
+    existing = await agent_store.get_by_slug(body.slug)
+    if existing:
+        return JSONResponse({"error": f"Slug {body.slug!r} already in use"}, status_code=409)
+    if body.category not in AGENT_CATEGORIES:
+        return JSONResponse({"error": f"Invalid category {body.category!r}"}, status_code=400)
+    a = await agent_store.create(
+        slug=body.slug,
+        name=body.name,
+        category=body.category,
+        direction=body.direction,
+        system_prompt=body.system_prompt,
+        opening_line=body.opening_line,
+        voice_id=body.voice_id,
+        model=body.model,
+        handoff_number=body.handoff_number,
+        handoff_action_url=body.handoff_action_url,
+        from_numbers=body.from_numbers,
+        knowledge_base=body.knowledge_base,
+        active=body.active,
+    )
+    return Agent(**a.to_dict())
+
+
+@app.put("/agents/{agent_id}", response_model=Agent)
+async def update_agent(agent_id: int, body: AgentUpdate, _=Depends(verify_admin_api_key)):
+    a = await agent_store.get(agent_id)
+    if not a:
+        return JSONResponse({"error": "Agent not found"}, status_code=404)
+    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    a = await agent_store.update(agent_id, **fields)
+    return Agent(**a.to_dict())
+
+
+@app.delete("/agents/{agent_id}")
+async def delete_agent(agent_id: int, _=Depends(verify_admin_api_key)):
+    """Delete an agent. Templates (is_template=True) cannot be deleted."""
+    deleted = await agent_store.delete(agent_id)
+    if not deleted:
+        return JSONResponse({"error": "Agent not found or is a template (cannot delete)"}, status_code=404)
+    return {"ok": True, "id": agent_id}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -160,66 +283,116 @@ async def incoming_support_conversation_webhook(
     return Response(content=str(response), media_type="application/xml")
 
 
-@app.post("/webhook/outbound-conversation")
-async def outbound_conversation_webhook(
+@app.post("/webhook/voice/{agent_id}")
+async def voice_webhook(
+    agent_id: int,
     request: Request,
     _sig: None = Depends(verify_twilio_signature),
 ):
-    """Outbound sales — ConversationRelay with sales persona."""
+    """Single agent-aware TwiML endpoint. Replaces the old hardcoded
+    /webhook/outbound-conversation and /webhook/incoming-support-conversation.
+    Looks up the agent, builds ConversationRelay TwiML with the agent's
+    voice/prompt, and connects.
+
+    Twilio calls this when:
+      - An outbound call is answered (the agent's id is in the URL we dialed)
+      - A Twilio number with this URL configured receives an inbound call
+
+    The action URL on the <Connect> verb goes to /webhook/transfer/{agent_id}
+    so handoff goes back to the right transfer endpoint.
+    """
     form = await request.form()
     call_sid = form.get("CallSid")
-    await call_store.update(call_sid, status="answered")
+    from_number = form.get("From", "")
+    to_number = form.get("To", "")
 
-    # Fetch lead info from call_store so the WebSocket pipeline can use
-    # lead_name and lead_context in the system prompt and opening line
+    agent = await agent_store.get(agent_id)
+    if not agent or not agent.active:
+        logger.warning(f"[Voice] Unknown or inactive agent_id={agent_id} for call={call_sid}")
+        return Response(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>This line is not configured. Goodbye.</Say></Response>',
+            media_type="application/xml",
+        )
+
+    # Look up the call's lead info from call_store (if it's an outbound we
+    # already recorded at /call time)
     call_state = await call_store.get(call_sid)
     lead_name = ""
     lead_context = ""
     if call_state:
         lead_name = getattr(call_state, "lead_name", "") or ""
-        # The 'context' field in CallState holds what was sent as `context`
-        # or `lead_context` in the /call request body
         lead_context = getattr(call_state, "context", "") or ""
 
-    logger.info(f"[Webhook] Outbound conversation answered | sid={call_sid} lead={lead_name!r} ctx={lead_context!r}")
+    # Mark the call as answered
+    await call_store.update(call_sid, status="answered")
 
+    # Log it
+    direction = "inbound" if (call_state is None or call_state.direction == "inbound") else "outbound"
+    logger.info(
+        f"[Voice/{direction}] agent={agent.slug} (id={agent_id}) call={call_sid} "
+        f"from={redact_phone(from_number)} to={redact_phone(to_number)} lead={lead_name!r}"
+    )
+
+    # Persist the call if this is an inbound call (we didn't record it at /call time)
+    if not call_state:
+        await call_store.create(
+            call_sid=call_sid,
+            phone_number=from_number,
+            direction="inbound",
+            purpose=agent.category,
+            context="",
+            line=f"agent-{agent.slug}",
+            caller_id=to_number,  # the Twilio number they dialed
+            lead_name=None,
+        )
+    # Always link the agent_id (even on outbound where call_state already exists)
+    try:
+        async with get_conn() as conn:
+            await conn.execute(
+                "UPDATE calls SET agent_id = $1 WHERE call_sid = $2",
+                agent_id, call_sid,
+            )
+    except Exception as e:
+        logger.warning(f"[Voice] Failed to link agent_id to call {call_sid}: {e}")
+
+    # Build the TwiML
     response = VoiceResponse()
     connect = Connect()
-    ws_url = "wss://ws.coastalvanguard.org/ws/conversation?persona=sales"
-    # Twilio's ConversationRelay `parameters` are passed as `customParameters`
-    # in the WebSocket setup event. We pass lead_name and lead_context so
-    # the backend can personalize the greeting and system prompt.
+    # WebSocket URL — pass agent_id so the VPS can look up the prompt
+    ws_url = f"wss://ws.coastalvanguard.org/ws/conversation?agent_id={agent_id}"
     params = {}
     if lead_name:
         params["lead_name"] = lead_name
     if lead_context:
         params["lead_context"] = lead_context
+    # Custom param the WS pipeline will read
+    params["persona"] = agent.category  # legacy compat
     connect.conversation_relay(
         url=ws_url,
         ttsProvider="ElevenLabs",
-        voice="TxGEqnHWrfWFTfGW9XjX",  # Josh
+        voice=agent.voice_id,
         transcriptionProvider="Deepgram",
         speechModel="nova-2-general",
         interruptible="any",
         interruptSensitivity="medium",
         **({"parameters": params} if params else {}),
     )
-    # When ConversationRelay ends (either normally OR via the "end" message
-    # with handoffData), Twilio POSTs to this action URL. The /webhook/transfer
-    # handler reads HandoffData and decides whether to <Dial> David.
-    connect.action(f"{settings.BASE_URL}/webhook/transfer")
+    # Action URL — when ConversationRelay ends, Twilio POSTs here
+    action_url = agent.handoff_action_url or f"{settings.BASE_URL}/webhook/transfer/{agent_id}"
+    connect.action(action_url)
     response.append(connect)
     return Response(content=str(response), media_type="application/xml")
 
 
-@app.post("/webhook/transfer")
+@app.post("/webhook/transfer/{agent_id}")
 async def transfer_webhook(
+    agent_id: int,
     request: Request,
     _sig: None = Depends(verify_twilio_signature),
 ):
     """Called by Twilio when ConversationRelay ends. If handoffData.reasonCode
-    is "live-agent-handoff", this returns TwiML that <Dial>s the human rep
-    (David) so the lead talks to a real person. Otherwise the call ends.
+    is "live-agent-handoff", this returns TwiML that <Dial>s the agent's
+    handoff number. Otherwise the call ends with a goodbye.
 
     The handoff data is passed via the WebSocket "end" message in
     conversation_pipeline.py when the lead asks for a human / wants to order.
@@ -236,56 +409,89 @@ async def transfer_webhook(
 
     reason_code = handoff_data.get("reasonCode", "")
     lead_name = handoff_data.get("lead_name", "the caller")
-    persona = handoff_data.get("persona", "support")
     reason = handoff_data.get("reason", "the caller requested a human")
 
-    logger.info(f"[Transfer] call={call_sid} reasonCode={reason_code!r} persona={persona} lead={lead_name!r}")
+    # Look up the agent
+    agent = await agent_store.get(agent_id)
+
+    logger.info(
+        f"[Transfer] call={call_sid} agent_id={agent_id} reasonCode={reason_code!r} lead={lead_name!r}"
+    )
 
     response = VoiceResponse()
 
     if reason_code != "live-agent-handoff":
         # Normal end of call (caller hung up, conversation finished, etc).
-        # Just say goodbye and end.
-        response.say("Thanks for calling Coastal Vanguard. Have a great day.")
+        goodbye = "Thanks for calling. Have a great day."
+        if agent:
+            goodbye = f"Thanks for calling {agent.name}. Have a great day."
+        response.say(goodbye, voice="Polly.Joanna")
         return Response(content=str(response), media_type="application/xml")
 
-    # Live-agent handoff: dial the human rep.
-    # We whisper context to David before bridging: who the lead is, what
-    # they wanted, and which persona was active. David hears this, the
-    # caller does not.
-    whisper = (
-        f"Live handoff. Lead: {lead_name}. "
-        f"Persona: {persona}. "
-        f"Reason: {reason[:120]}. "
-        f"When the caller hears the beep, greet them and confirm their order."
-    )
+    # No agent handoff number configured — fall back to a text instead
+    handoff_number = agent.handoff_number if agent else None
+    handoff_number = handoff_number or settings.HUMAN_REP_NUMBER  # env fallback
+
+    if not handoff_number:
+        # No number to dial — just say goodbye
+        response.say(
+            "Sorry, our specialist isn't available right now. We'll text you a callback number. Goodbye.",
+            voice="Polly.Joanna",
+        )
+        return Response(content=str(response), media_type="application/xml")
+
+    # Live-agent handoff: dial the human rep
     dial = response.dial(
-        caller_id=settings.TWILIO_PHONE_NUMBER,  # Our Twilio number shows on caller ID
-        answer_on_bridge=True,  # Bridge only when David picks up
-        timeout=30,  # Ring David for 30s
+        caller_id=settings.TWILIO_PHONE_NUMBER,
+        answer_on_bridge=True,
+        timeout=30,
     )
-    # The <Number> noun dials an external number. We use it because David's
-    # number (+17543529826) is a personal cell, not a Twilio client.
-    dial.number(
-        settings.HUMAN_REP_NUMBER,
-        send_digits="wwww1928",  # Optional: bypass David's voicemail
-    )
+    dial.number(handoff_number)
 
-    # If the dial fails (David doesn't answer), say a goodbye and offer
-    # to text instead.
-    if dial.payload:
-        # action URL on the dial — if David doesn't pick up, Twilio hits this
-        # and we can fall back to an SMS or voicemail.
-        pass
-
-    # Fallback if <Dial> doesn't complete (David didn't answer)
+    # Fallback if <Dial> doesn't complete (the human didn't answer)
     response.say(
-        f"Sorry, our specialist didn't pick up. I'll text you a direct line "
-        f"so you can reach us. Sorry about that!",
+        f"Sorry, our specialist didn't pick up. I'll text you a direct line so you can reach us. Sorry about that!",
         voice="Polly.Joanna",
     )
 
     return Response(content=str(response), media_type="application/xml")
+
+
+# ── Legacy webhook routes (kept for backwards compat) ───────────────
+# /webhook/outbound-conversation and /webhook/transfer now require an
+# agent_id. The old unparameterized routes route to the first active
+# "outbound" agent as a sensible default.
+@app.post("/webhook/outbound-conversation")
+async def legacy_outbound_conversation_webhook(
+    request: Request,
+    _sig: None = Depends(verify_twilio_signature),
+):
+    """Legacy route — routes to the first active outbound sales agent."""
+    agents = await agent_store.list(only_active=True)
+    fallback = next((a for a in agents if a.category == "outbound_sales"), None) or (agents[0] if agents else None)
+    if not fallback:
+        return Response(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>No agent configured. Goodbye.</Say></Response>',
+            media_type="application/xml",
+        )
+    # Forward to the new route
+    return await voice_webhook(fallback.id, request, _sig)
+
+
+@app.post("/webhook/transfer")
+async def legacy_transfer_webhook(
+    request: Request,
+    _sig: None = Depends(verify_twilio_signature),
+):
+    """Legacy /webhook/transfer — picks the first active outbound agent."""
+    agents = await agent_store.list(only_active=True)
+    fallback = next((a for a in agents if a.category == "outbound_sales"), None) or (agents[0] if agents else None)
+    if not fallback:
+        return Response(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>No agent configured. Goodbye.</Say></Response>',
+            media_type="application/xml",
+        )
+    return await transfer_webhook(fallback.id, request, _sig)
 
 
 @app.post("/webhook/incoming-sms")
@@ -457,29 +663,69 @@ async def trigger_outbound_call(
     body: OutboundCallRequest,
     _=Depends(verify_admin_api_key),
 ):
-    """Trigger an AI-powered outbound sales call. Requires admin API key.
+    """Trigger an AI-powered outbound call. Requires admin API key.
 
-    Rotates caller ID between the two 754 numbers (primary/secondary) for
-    local-presence dialing. Uses the sales WebSocket pipeline.
+    Uses the agent specified by `agent_id` (or the first active outbound_sales
+    agent as fallback). The agent controls the voice, model, system prompt,
+    opening line, and which Twilio number to call from.
 
     Body fields:
       to:           E.164 phone number of the lead
       purpose:      sales, lead_qualification, sales_close, appointment
-      context:      Free-form context
-      lead_name:    Lead's name (used in greeting)
+      context:      Free-form context (stored in call row)
+      lead_name:    Lead's name (used in greeting + system prompt)
       lead_context: Specific context (e.g., "showed interest in retatrutide")
       tz:           IANA timezone (default America/New_York)
+      agent_id:     Which agent persona to use (optional)
     """
-    # Round-robin caller ID rotation between the 2 outbound numbers
-    primary_cid = os.getenv("TWILIO_OUTBOUND_PRIMARY", "+17542193360")
-    secondary_cid = os.getenv("TWILIO_OUTBOUND_SECONDARY", "+17542092728")
-    # Simple rotation: count outbound calls in last 1 min and alternate
-    # (production: use Redis counter or DB-backed counter)
-    import random
-    caller_id = random.choice([primary_cid, secondary_cid])
+    # ── Resolve the agent ─────────────────────────────────────
+    agent = None
+    if body.agent_id:
+        agent = await agent_store.get(body.agent_id)
+        if not agent:
+            return CallResponse(
+                success=False, to=body.to, purpose=body.purpose,
+                status="rejected_no_agent",
+                message=f"Agent id {body.agent_id} not found",
+            )
+        if agent.direction == "inbound":
+            return CallResponse(
+                success=False, to=body.to, purpose=body.purpose,
+                status="rejected_agent_inbound_only",
+                message=f"Agent {agent.slug!r} is inbound-only",
+            )
+    else:
+        # Pick the first active outbound agent
+        all_agents = await agent_store.list(only_active=True)
+        agent = next(
+            (a for a in all_agents if a.category == "outbound_sales" and a.direction in ("outbound", "both")),
+            None,
+        ) or next(
+            (a for a in all_agents if a.direction in ("outbound", "both")),
+            None,
+        )
+    if not agent:
+        return CallResponse(
+            success=False, to=body.to, purpose=body.purpose,
+            status="rejected_no_agent",
+            message="No active outbound agent configured. Create one via POST /agents.",
+        )
 
-    # Compliance check: calling hours (7am-7pm local time)
-    # Lead timezone passed in body.tz (default: America/New_York)
+    # ── Pick a caller ID from the agent's pool ─────────────────
+    import random
+    from_numbers_pool = [n.strip() for n in (agent.from_numbers or "").split(",") if n.strip()]
+    if not from_numbers_pool:
+        # Fall back to env defaults
+        from_numbers_pool = [
+            os.getenv("TWILIO_OUTBOUND_PRIMARY", settings.TWILIO_PHONE_NUMBER),
+            os.getenv("TWILIO_OUTBOUND_SECONDARY", settings.TWILIO_PHONE_NUMBER),
+        ]
+        from_numbers_pool = [n for n in from_numbers_pool if n]
+    if not from_numbers_pool:
+        from_numbers_pool = [settings.TWILIO_PHONE_NUMBER]
+    caller_id = random.choice(from_numbers_pool)
+
+    # ── Compliance check: calling hours (7am-7pm local time) ─────
     from datetime import datetime
     try:
         from zoneinfo import ZoneInfo
@@ -497,7 +743,7 @@ async def trigger_outbound_call(
     except Exception as e:
         logger.warning(f"Calling-hours check failed (non-fatal): {e}")
 
-    # DNC list check (if env var set)
+    # ── DNC list check (env var for now; Phase 2 will use DB) ───
     dnc_list_raw = os.getenv("DNC_NUMBERS", "")
     if dnc_list_raw:
         dnc_set = set(x.strip() for x in dnc_list_raw.split(","))
@@ -510,14 +756,16 @@ async def trigger_outbound_call(
                 message="Number is on DNC list",
             )
 
+    # ── Place the call ───────────────────────────────────────────
     call = twilio_client.calls.create(
         to=body.to,
         from_=caller_id,
-        url=f"{settings.BASE_URL}/webhook/outbound-conversation",  # When lead answers, gets ConversationRelay TwiML
-        status_callback=f"{settings.BASE_URL}/webhook/outbound-status",  # Status events
+        # The URL Twilio fetches when the lead answers. Includes the agent_id
+        # so the TwiML handler knows which agent persona to use.
+        url=f"{settings.BASE_URL}/webhook/voice/{agent.id}",
+        status_callback=f"{settings.BASE_URL}/webhook/outbound-status",
         status_callback_event=["initiated", "ringing", "answered", "completed"],
         status_callback_method="POST",
-        # Recording disclosure: announce call is recorded at start
         record=True,
     )
 
@@ -527,12 +775,25 @@ async def trigger_outbound_call(
         direction="outbound",
         purpose=body.purpose,
         context=body.context or "",
-        line="outbound-754",
+        line=f"agent-{agent.slug}",
         caller_id=caller_id,
         lead_name=body.lead_name,
     )
+    # Link the agent_id directly
+    try:
+        async with get_conn() as conn:
+            await conn.execute(
+                "UPDATE calls SET agent_id = $1 WHERE call_sid = $2",
+                agent.id, call.sid,
+            )
+    except Exception as e:
+        logger.warning(f"[/call] Failed to set agent_id on call {call.sid}: {e}")
+
     record_call("outbound", body.purpose, "initiated")
-    logger.info(f"[API] Outbound call | sid={call.sid} to={redact_phone(body.to)} purpose={body.purpose} from={caller_id}")
+    logger.info(
+        f"[API] Outbound call | agent={agent.slug} (id={agent.id}) sid={call.sid} "
+        f"to={redact_phone(body.to)} purpose={body.purpose} from={caller_id}"
+    )
 
     return CallResponse(
         success=True,
