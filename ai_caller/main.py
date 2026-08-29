@@ -153,9 +153,9 @@ async def incoming_support_conversation_webhook(
         interruptible="any",
         interruptSensitivity="medium",
         welcomeGreeting=f"Thank you for calling {settings.BRAND_NAME}. This is Marcus. How may I assist you today?",
+        # When ConversationRelay ends (handoff or normal), Twilio POSTs here.
+        action=f"{settings.BASE_URL}/webhook/transfer",
     )
-    # When ConversationRelay ends (handoff or normal), Twilio POSTs here.
-    connect.action(f"{settings.BASE_URL}/webhook/transfer")
     response.append(connect)
     return Response(content=str(response), media_type="application/xml")
 
@@ -202,12 +202,12 @@ async def outbound_conversation_webhook(
         speechModel="nova-2-general",
         interruptible="any",
         interruptSensitivity="medium",
+        # When ConversationRelay ends (either normally OR via the "end" message
+        # with handoffData), Twilio POSTs to this action URL. The /webhook/transfer
+        # handler reads HandoffData and decides whether to <Dial> David.
+        action=f"{settings.BASE_URL}/webhook/transfer",
         **({"parameters": params} if params else {}),
     )
-    # When ConversationRelay ends (either normally OR via the "end" message
-    # with handoffData), Twilio POSTs to this action URL. The /webhook/transfer
-    # handler reads HandoffData and decides whether to <Dial> David.
-    connect.action(f"{settings.BASE_URL}/webhook/transfer")
     response.append(connect)
     return Response(content=str(response), media_type="application/xml")
 
