@@ -143,7 +143,7 @@ async def incoming_support_conversation_webhook(
 
     response = VoiceResponse()
     connect = Connect()
-    ws_url = "f"wss://{settings.BRAND_WS_DOMAIN}/ws/conversation?persona=tollfree""
+    ws_url = f"wss://{settings.BRAND_WS_DOMAIN}/ws/conversation?persona=tollfree"
     connect.conversation_relay(
         url=ws_url,
         ttsProvider="ElevenLabs",
@@ -185,7 +185,7 @@ async def outbound_conversation_webhook(
 
     response = VoiceResponse()
     connect = Connect()
-    ws_url = "f"wss://{settings.BRAND_WS_DOMAIN}/ws/conversation?persona=sales""
+    ws_url = f"wss://{settings.BRAND_WS_DOMAIN}/ws/conversation?persona=sales"
     # Twilio's ConversationRelay `parameters` are passed as `customParameters`
     # in the WebSocket setup event. We pass lead_name and lead_context so
     # the backend can personalize the greeting and system prompt.
