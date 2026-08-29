@@ -40,7 +40,7 @@ FLY_API_URL = os.getenv("FLY_API_URL", "https://ai-caller-enterprise.fly.dev")
 FLY_ADMIN_KEY = os.getenv("FLY_ADMIN_KEY", "")
 HUMAN_REP_NUMBER = os.getenv("HUMAN_REP_NUMBER", "+17543529826")
 SELF_CLOSE_THRESHOLD_USD = int(os.getenv("SELF_CLOSE_THRESHOLD_USD", "400"))
-STRIPE_PAYMENT_LINK = os.getenv("STRIPE_PAYMENT_LINK", "https://buy.stripe.com/coastalvanguard")
+STRIPE_PAYMENT_LINK = os.getenv("STRIPE_PAYMENT_LINK", "")
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "10"))
 
 # ── Load catalog + persona DNA ──
@@ -371,7 +371,7 @@ async def handle_conversation_stream(websocket: WebSocket, persona: str = "suppo
                             f"{FLY_API_URL}/calls/{call_sid}/send-catalog-sms",
                             headers={"X-API-Key": FLY_ADMIN_KEY},
                             json={
-                                "url": "https://coastalvanguard.org",
+                                "url": os.getenv("BRAND_DOMAIN", "coastalvanguard.org"),
                                 "lead_phone": lead_phone,
                                 "package": recommended,
                                 "lead_name": lead_name,

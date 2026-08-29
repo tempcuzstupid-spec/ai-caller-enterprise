@@ -143,7 +143,7 @@ async def incoming_support_conversation_webhook(
 
     response = VoiceResponse()
     connect = Connect()
-    ws_url = "wss://ws.coastalvanguard.org/ws/conversation?persona=tollfree"
+    ws_url = "f"wss://{settings.BRAND_WS_DOMAIN}/ws/conversation?persona=tollfree""
     connect.conversation_relay(
         url=ws_url,
         ttsProvider="ElevenLabs",
@@ -152,7 +152,7 @@ async def incoming_support_conversation_webhook(
         speechModel="nova-2-general",
         interruptible="any",
         interruptSensitivity="medium",
-        welcomeGreeting="Thank you for calling Coastal Vanguard. This is Marcus. How may I assist you today?",
+        welcomeGreeting=f"Thank you for calling {settings.BRAND_NAME}. This is Marcus. How may I assist you today?",
     )
     # When ConversationRelay ends (handoff or normal), Twilio POSTs here.
     connect.action(f"{settings.BASE_URL}/webhook/transfer")
@@ -185,7 +185,7 @@ async def outbound_conversation_webhook(
 
     response = VoiceResponse()
     connect = Connect()
-    ws_url = "wss://ws.coastalvanguard.org/ws/conversation?persona=sales"
+    ws_url = "f"wss://{settings.BRAND_WS_DOMAIN}/ws/conversation?persona=sales""
     # Twilio's ConversationRelay `parameters` are passed as `customParameters`
     # in the WebSocket setup event. We pass lead_name and lead_context so
     # the backend can personalize the greeting and system prompt.
@@ -246,7 +246,7 @@ async def transfer_webhook(
     if reason_code != "live-agent-handoff":
         # Normal end of call (caller hung up, conversation finished, etc).
         # Just say goodbye and end.
-        response.say("Thanks for calling Coastal Vanguard. Have a great day.")
+        response.say(f"Thanks for calling {settings.BRAND_NAME}. Have a great day.")
         return Response(content=str(response), media_type="application/xml")
 
     # Live-agent handoff: dial the human rep.
@@ -311,7 +311,7 @@ async def incoming_sms_webhook(
         twilio_client.messages.create(
             to=from_number,
             from_=settings.TWILIO_PHONE_NUMBER,
-            body="You've been removed from our list. Sorry for the bother. — Marcus, Coastal Vanguard",
+            body=f"You've been removed from our list. Sorry for the bother. — Marcus, {settings.BRAND_NAME}",
         )
         logger.info(f"[SMS-In] DNC opt-out for {redact_phone(from_number)}")
         return Response(content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>', media_type="application/xml")
@@ -321,7 +321,7 @@ async def incoming_sms_webhook(
         twilio_client.messages.create(
             to=from_number,
             from_=settings.TWILIO_PHONE_NUMBER,
-            body=f"Here's the full Coastal Vanguard catalog: https://coastalvanguard.org — Marcus. Call or text me back anytime.",
+            body=f"Here's the full {settings.BRAND_NAME} catalog: https://{settings.BRAND_DOMAIN} — Marcus. Call or text me back anytime.",
         )
         logger.info(f"[SMS-In] Sent catalog link to {redact_phone(from_number)}")
         return Response(content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>', media_type="application/xml")
@@ -331,7 +331,7 @@ async def incoming_sms_webhook(
         to=from_number,
         from_=settings.TWILIO_PHONE_NUMBER,
         body=(
-            f"Hey! Marcus from Coastal Vanguard here — got your text. "
+            f"Hey! Marcus from {settings.BRAND_NAME} here — got your text. "
             f"Want me to send the catalog? Text CATALOG. "
             f"Or call me back at this number. — Marcus"
         ),
@@ -388,7 +388,7 @@ async def outbound_status_webhook(
             lead_name = getattr(call_state, "lead_name", "") if call_state else ""
             first_name = lead_name.split()[0] if lead_name else "there"
             sms_body = (
-                f"Hey {first_name} — this is Marcus from Coastal Vanguard. "
+                f"Hey {first_name} — this is Marcus from {settings.BRAND_NAME}. "
                 f"Just tried to give you a ring about our wellness programs. "
                 f"When you get a sec, call me back at {from_number} or text this number. "
                 f"Talk soon! — Marcus"
@@ -634,7 +634,7 @@ async def version():
     return {
         "git_sha": os.getenv("GIT_SHA", "unset"),
         "code_hash": h,
-        "ws_url": os.getenv("WS_GATEWAY_URL", "wss://ws.coastalvanguard.org/ws"),
+        "ws_url": os.getenv("WS_GATEWAY_URL", f"wss://{settings.BRAND_WS_DOMAIN}/ws"),
         "base_url": settings.BASE_URL,
         "has_ws_route": hasattr(app, "router") and any(getattr(r, "path", "") == "/ws/media-stream" for r in app.router.routes),
     }
@@ -719,10 +719,10 @@ async def send_catalog_sms(call_sid: str, request: Request, _=Depends(verify_adm
     Optional body fields:
       - package: package name (e.g. "A1 · First Time, Done Right")
       - lead_name: personalization (e.g. "David")
-      - url: link to send (defaults to coastalvanguard.org)
+      - url: link to send (defaults to the brand domain)
     """
     body = await request.json()
-    url = body.get("url", "https://coastalvanguard.org")
+    url = body.get("url", f"https://{settings.BRAND_DOMAIN}")
     package = body.get("package", "").strip()
     lead_phone = body.get("lead_phone")
 
@@ -741,25 +741,25 @@ async def send_catalog_sms(call_sid: str, request: Request, _=Depends(verify_adm
     # Personalize the message based on whether Marcus recommended a package
     if package and first_name:
         sms_body = (
-            f"Hey {first_name} — Marcus from Coastal Vanguard here. "
+            f"Hey {first_name} — Marcus from {settings.BRAND_NAME} here. "
             f"Like we discussed, here's more on the {package}: {url} "
             f"Take your time — text me back anytime on this number. — Marcus"
         )
     elif package:
         sms_body = (
-            f"Hey — Marcus from Coastal Vanguard. "
+            f"Hey — Marcus from {settings.BRAND_NAME}. "
             f"Like we discussed, here's more on the {package}: {url} "
             f"Text back anytime on this number. — Marcus"
         )
     elif first_name:
         sms_body = (
-            f"Hey {first_name} — Marcus from Coastal Vanguard here. "
+            f"Hey {first_name} — Marcus from {settings.BRAND_NAME} here. "
             f"Here's our full catalog as promised: {url} "
             f"Text me back anytime on this number. — Marcus"
         )
     else:
         sms_body = (
-            f"Thanks for your interest in Coastal Vanguard! "
+            f"Thanks for your interest in {settings.BRAND_NAME}! "
             f"Here's the full catalog: {url} — Marcus"
         )
 
@@ -792,7 +792,7 @@ async def send_payment_link(call_sid: str, request: Request, _=Depends(verify_ad
         msg = twilio_client.messages.create(
             to=lead_phone,
             from_=settings.TWILIO_PHONE_NUMBER,
-            body=f"Here's your secure payment link from Coastal Vanguard: {url} — Marcus",
+            body=f"Here's your secure payment link from {settings.BRAND_NAME}: {url} — Marcus",
         )
         return {"success": True, "message_sid": msg.sid, "to": lead_phone}
     except Exception as e:

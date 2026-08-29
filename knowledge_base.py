@@ -1,6 +1,15 @@
-# COASTAL VANGUARD — KNOWLEDGE BASE
-# Complete product catalog, packages, pricing, contraindications.
-# Load this into the LLM system prompt for accurate responses.
+# COASTAL VANGUARD → PREMIUM MERIDIAN rebrand (2026-08-29)
+# Brand strings are env-var driven — to rebrand in the future, change
+# BRAND_NAME / BRAND_DOMAIN / BRAND_LEGAL_NAME in the app's env vars.
+# This file is loaded at import time and used as a fallback; the actual
+# deployed values come from the runtime config (ai_caller.config.Settings).
+
+import os
+
+BRAND_NAME = os.getenv("BRAND_NAME", "Coastal Vanguard")
+BRAND_DOMAIN = os.getenv("BRAND_DOMAIN", "coastalvanguard.org")
+BRAND_LEGAL_NAME = os.getenv("BRAND_LEGAL_NAME", "Coastal Vanguard LLC")
+BRAND_EMAIL = os.getenv("BRAND_EMAIL", "Management@coastalvanguard.org")
 
 # ── SHIPPING & PAYMENT ──
 SHIPPING = {
@@ -13,9 +22,9 @@ SHIPPING = {
 PAYMENT_METHODS = ["CashApp", "Zelle", "Apple Pay", "Visa", "Mastercard", "Amex", "Bank Wire", "Crypto (USDC)"]
 
 CONTACT = {
-    "phone": "(386) 843-8160",
-    "email": "Management@coastalvanguard.org",
-    "website": "coastalvanguard.org",
+    "phone": os.getenv("BRAND_PHONE", "(386) 843-8160"),
+    "email": BRAND_EMAIL,
+    "website": BRAND_DOMAIN,
 }
 
 # ── INDIVIDUAL PRODUCTS (top sellers) ──

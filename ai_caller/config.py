@@ -44,6 +44,19 @@ class Settings(BaseSettings):
     REQUEST_TIMEOUT: int = 30
     MAX_CALL_DURATION_MINUTES: int = 30
 
+    # ── Brand configuration (multi-tenant ready) ──────────────
+    # The peptide business is branded as "Premium Meridian".
+    # The AI Caller swaps the brand name + website domain in
+    # Marcus's voice, TwiML greetings, SMS bodies, and knowledge
+    # base based on these env vars. To rebrand in the future,
+    # change these two env vars and redeploy — no code changes.
+    BRAND_NAME: str = "Coastal Vanguard"           # What Marcus says
+    BRAND_DOMAIN: str = "coastalvanguard.org"      # Catalog link
+    BRAND_LEGAL_NAME: str = "Coastal Vanguard LLC"  # Legal disclaimers
+    BRAND_PHONE: str = ""                          # Customer support number (empty = don't include)
+    BRAND_EMAIL: str = ""                          # Support email
+    BRAND_WS_DOMAIN: str = "ws.coastalvanguard.org"  # WebSocket gateway domain
+
     # Circuit Breaker
     CB_FAILURE_THRESHOLD: int = 5
     CB_RECOVERY_TIMEOUT: int = 30
