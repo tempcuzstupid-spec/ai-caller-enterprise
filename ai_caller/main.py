@@ -103,7 +103,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Auto-deploy trigger: 2026-08-29T20:04:15.764375Z
 # Prometheus metrics endpoint
 metrics_app = make_asgi_app()
 app.mount("/metrics", metrics_app)
